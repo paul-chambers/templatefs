@@ -1,3 +1,6 @@
+cmake-*
+templatefs
+.idea
 # Prerequisites
 *.d
 
