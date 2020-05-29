@@ -2,18 +2,18 @@
     derived from passthrough_fh.c, part of the libfuse project.
     See https://github.com/libfuse/libfuse/blob/master/example/passthrough_fh.c
 
-    Since the original is distributed under the terms of the GNU GPLv2
-    and this counts as a 'derivative work', it is also provided under
-    the terms of GPL v2.
+    The original is distributed under the terms of the GNU GPLv2.
+    Since this counts as a 'derivative work', it is also provided
+    under the terms of GPL v2.
 
-    Copyright (c) Paul Chambers, 2020. All rights resulterved.
+    Copyright (c) Paul Chambers, 2020. All rights reserved.
 */
 
 /** @file
  *
  * This file system mirrors the existing file system hierarchy of the
  * system, starting at the root file system. This is implemented by
- * just "passing through" all requests to the corresultponding user-space
+ * just "passing through" all requests to the corresponding user-space
  * libc functions. This implementation is a little more sophisticated
  * than the one in passthrough.c, so performance is not quite as bad.
  *
@@ -21,15 +21,9 @@
  * \include templatefs.c
  */
 
-#define FUSE_USE_VERSION 39
-
-#ifdef HAVE_CONFIG_H
-#include <config.h>
-#endif
+#include "templatefs.h"
 
 #define _GNU_SOURCE
-
-#include <fuse3/fuse.h>
 
 #ifdef HAVE_LIBULOCKMGR
 #include <ulockmgr.h>
@@ -37,573 +31,401 @@
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <stddef.h>
+#include <syslog.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <dirent.h>
 #include <errno.h>
-#include <sys/time.h>
+#include <dirent.h>
 
 #ifdef HAVE_SETXATTR
 #include <sys/xattr.h>
 #endif
 
-#include <sys/file.h> /* flock(2) */
+#include <fuse3/fuse.h>
+#include <fuse3/fuse_lowlevel.h>
+#include <fuse3/fuse_common.h>
+#include <fuse3/fuse_opt.h>
+#include <dlfcn.h>
 
-static void * tmpl_init( struct fuse_conn_info * conn, struct fuse_config * cfg )
+#include "callbacks.h"
+
+#define PACKAGE_VERSION "1.0"
+
+#define UNUSED(arg) __attribute__((unused)) arg
+
+const char * myName = NULL;
+
+struct fuse_cmdline_opts fuseOpts;
+
+struct tmpl_options
 {
-    (void) conn;
-    cfg->use_ino     = 1;
-    cfg->nullpath_ok = 1;
+    const char *  source;
+    int           debug;
+    int           writeback;
+    int           flock;
+    int           xattr;
+} tmplOpts;
 
-    /* Pick up changes from lower filesystem right away. This is
-       also necessary for better hardlink support. When the kernel
-       calls the unlink() handler, it does not know the inode of
-       the to-be-removed entry and can therefore not invalidate
-       the cache of the associated inode - resulting in an
-       incorrect st_nlink value being reported for any remaining
-       hardlinks to this inode. */
-    cfg->entry_timeout    = 0;
-    cfg->attr_timeout     = 0;
-    cfg->negative_timeout = 0;
+#define MOUNT_OPT( t, p, v ) { t, offsetof(struct tmpl_options, p), v }
 
-    return NULL;
-}
-
-static int tmpl_getattr( const char * path, struct stat * stbuf, struct fuse_file_info * fi )
+const struct fuse_opt tmplCmdLineOptions[] =
 {
-    if ( fi )
-    {
-        return( (fstat( fi->fh, stbuf ) == -1)? -errno : 0);
-    }
-    else
-    {
-        return( (lstat( path, stbuf ) == -1)? -errno : 0);
-    }
-}
+        MOUNT_OPT( "source=%s",    source,    0 ),
+        MOUNT_OPT( "writeback",    writeback, 1 ),
+        MOUNT_OPT( "no_writeback", writeback, 0 ),
+        MOUNT_OPT( "flock",        flock,     1 ),
+        MOUNT_OPT( "no_flock",     flock,     0 ),
+        MOUNT_OPT( "xattr",        xattr,     1 ),
+        MOUNT_OPT( "no_xattr",     xattr,     0 ),
 
-static int tmpl_access( const char * path, int mask )
-{
-    return( (access( path, mask ) == -1)? -errno : 0);
-}
-
-static int tmpl_readlink( const char * path, char * buf, size_t size )
-{
-    int result;
-
-    result = readlink( path, buf, size - 1 );
-    if ( result == -1 )
-    {
-        return -errno;
-    }
-
-    buf[result] = '\0';
-    return 0;
-}
-
-struct tmpl_dirp
-{
-    DIR           * dp;
-    struct dirent * entry;
-    off_t           offset;
+        FUSE_OPT_END
 };
 
-static int tmpl_opendir( const char * path, struct fuse_file_info * fi )
-{
-    int result;
-    struct tmpl_dirp * d = malloc( sizeof( struct tmpl_dirp ));
+// ------------------------------------------------------------------------------
 
-    if ( d == NULL)
+unsigned int depth = 0;
+void *symbols = NULL;
+
+const char leader[] = "...............................";
+
+__attribute__((no_instrument_function))
+void __cyg_profile_func_enter( void * func, void * caller )
+{
+    Dl_info info;
+    int result = 0;
+
+    if (symbols != NULL)
     {
-        return -ENOMEM;
+        result = dladdr( func, &info );
+    }
+    if ( result != 0 && info.dli_sname != NULL )
+    {
+        syslog( LOG_DEBUG, "%.*s{ %s", 2 * depth, leader, info.dli_sname );
+    } else {
+        syslog( LOG_DEBUG, "%.*s{ %p", 2 * depth, leader, func );
     }
 
-    d->dp = opendir( path );
-    if ( d->dp == NULL)
+    ++depth;
+}
+
+__attribute__((no_instrument_function))
+void __cyg_profile_func_exit( void * func, void * caller )
+{
+    Dl_info info;
+    int result = 0;
+
+    --depth;
+
+    info.dli_sname = NULL;
+    if ( symbols != NULL)
     {
-        result = -errno;
-        free( d );
-        return result;
+        result = dladdr( func, &info );
     }
-    d->offset = 0;
-    d->entry  = NULL;
-
-    fi->fh = (unsigned long) d;
-    return 0;
-}
-
-static inline struct tmpl_dirp * get_dirp( struct fuse_file_info * fi )
-{
-    return (struct tmpl_dirp *) (uintptr_t) fi->fh;
-}
-
-static int tmpl_readdir( const char * path, void * buf, fuse_fill_dir_t filler,
-                         off_t offset, struct fuse_file_info * fi,
-                         enum fuse_readdir_flags flags )
-{
-    (void) path;
-
-    struct tmpl_dirp * d = get_dirp( fi );
-
-    if ( offset != d->offset )
+    if ( result != 0 && info.dli_sname != NULL )
     {
+        syslog( LOG_DEBUG, "%.*s  %s }", 2 * depth, leader, info.dli_sname );
+    }
+    else
+    {
+        syslog( LOG_DEBUG, "%.*s  %p }", 2 * depth, leader, func );
+    }
+}
+
+// ------------------------------------------------------------------------------
+
+#define FUSE_HELPER_OPT( t, p ) \
+    { t, offsetof(struct fuse_cmdline_opts, p), 1 }
+
+static const struct fuse_opt tmpl_helper_opts[] = {
+        FUSE_HELPER_OPT( "-h", show_help ),
+        FUSE_HELPER_OPT( "--help", show_help ),
+        FUSE_HELPER_OPT( "-V", show_version ),
+        FUSE_HELPER_OPT( "--version", show_version ),
+        FUSE_HELPER_OPT( "-d", debug ),
+        FUSE_OPT_KEY( "-d", FUSE_OPT_KEY_KEEP ),
+        FUSE_HELPER_OPT( "-d", foreground ),
+        FUSE_HELPER_OPT( "debug", debug ),
+        FUSE_HELPER_OPT( "debug", foreground ),
+        FUSE_OPT_KEY( "debug", FUSE_OPT_KEY_KEEP ),
+        FUSE_HELPER_OPT( "-f", foreground ),
+        FUSE_HELPER_OPT( "-s", singlethread ),
+        FUSE_HELPER_OPT( "fsname=", nodefault_subtype ),
+        FUSE_OPT_KEY( "fsname=", FUSE_OPT_KEY_KEEP ),
 #ifndef __FreeBSD__
-        seekdir( d->dp, offset );
-#else
-        /* Subtract the one that we add when calling
-                   telldir() below */
-        seekdir( d->dp, offset - 1 );
+        FUSE_HELPER_OPT( "subtype=", nodefault_subtype ),
+        FUSE_OPT_KEY( "subtype=", FUSE_OPT_KEY_KEEP ),
 #endif
-        d->entry  = NULL;
-        d->offset = offset;
-    }
-    while ( 1 )
+        FUSE_HELPER_OPT( "clone_fd", clone_fd ),
+        FUSE_HELPER_OPT( "max_idle_threads=%u", max_idle_threads ),
+        FUSE_OPT_END
+};
+
+int tmpl_helper_opt_proc( void * data, const char * arg, int key,
+                                 struct fuse_args * outargs )
+{
+    (void) outargs;
+    struct fuse_cmdline_opts * opts = data;
+
+    switch ( key )
     {
-        struct stat              st;
-        off_t                    nextoff;
-        enum fuse_fill_dir_flags fill_flags = 0;
-
-        if ( !d->entry )
+    case FUSE_OPT_KEY_NONOPT:
+        if ( !opts->mountpoint )
         {
-            d->entry = readdir( d->dp );
-            if ( !d->entry )
+            char mountpoint[PATH_MAX] = "";
+            if ( realpath( arg, mountpoint ) == NULL)
             {
-                break;
+                fuse_log( FUSE_LOG_ERR,
+                          "fuse: bad mount point `%s': %s\n",
+                          arg, strerror(errno));
+                return -1;
             }
+            return fuse_opt_add_opt( &opts->mountpoint, mountpoint );
         }
-#ifdef HAVE_FSTATAT
-        if (flags & FUSE_READDIR_PLUS) {
-            int result;
-
-            result = fstatat( dirfd(d->dp), d->entry->d_name, &st, AT_SYMLINK_NOFOLLOW);
-            if (result != -1)
-            {
-                fill_flags |= FUSE_FILL_DIR_PLUS;
-            }
-        }
-#endif
-        if ( !(fill_flags & FUSE_FILL_DIR_PLUS))
+        else
         {
-            memset( &st, 0, sizeof( st ));
-            st.st_ino  = d->entry->d_ino;
-            st.st_mode = d->entry->d_type << 12;
+            fuse_log( FUSE_LOG_ERR, "fuse: invalid argument `%s'\n", arg );
+            return -1;
         }
-        nextoff = telldir( d->dp );
+
+    default:
+        /* Pass through unknown options */
+        return 1;
+    }
+}
+
+/* Under FreeBSD, there is no subtype option so this
+   function actually sets the fsname */
+int add_default_subtype( const char * progname, struct fuse_args * args )
+{
+    int  res;
+    char * subtype_opt;
+
+    const char * basename = strrchr( progname, '/' );
+    if ( basename == NULL)
+        basename = progname;
+    else if ( basename[1] != '\0' )
+        basename++;
+
+    subtype_opt = (char *) malloc( strlen( basename ) + 64 );
+    if ( subtype_opt == NULL)
+    {
+        fuse_log( FUSE_LOG_ERR, "fuse: memory allocation failed\n" );
+        return -1;
+    }
 #ifdef __FreeBSD__
-        /* Under FreeBSD, telldir() may return 0 the first time
-                   it is called. But for libfuse, an offset of zero
-                   means that offsets are not supported, so we shift
-                   everything by one. */
-        nextoff++;
+    sprintf(subtype_opt, "-ofsname=%s", basename);
+#else
+    sprintf( subtype_opt, "-o subtype=%s", basename );
 #endif
-        if ( filler( buf, d->entry->d_name, &st, nextoff, fill_flags ))
+    res = fuse_opt_add_arg( args, subtype_opt );
+    free( subtype_opt );
+    return res;
+}
+
+
+// ------------------------------------------------------------------------------
+
+
+int processTmplOpts( void * data, const char * arg, int key, struct fuse_args * outargs )
+{
+    return 1;
+}
+
+__attribute__((no_instrument_function))
+void log_to_syslog( enum fuse_log_level level, const char * fmt, va_list ap )
+{
+    vsyslog( level, fmt, ap );
+}
+
+#define dumpArgs(args) dumpArgs2( __LINE__, args )
+void dumpArgs2( unsigned int lineNum, struct fuse_args * args )
+{
+    fuse_log( FUSE_LOG_DEBUG, "At line %d. allocated: %d", lineNum, args->allocated);
+    fuse_log( FUSE_LOG_DEBUG, "argc: %d", args->argc );
+    for (int i = 0; i < args->argc; ++i )
+    {
+        fuse_log( FUSE_LOG_DEBUG, "%d: \"%s\"", i, args->argv[i] );
+    }
+}
+
+/* work around a problem with libfuse - bug? */
+struct fuse_args * fuse_args_init( int argc, char ** argv )
+{
+    struct fuse_args * result = calloc( 1, sizeof(struct fuse_args) );
+    if (result == NULL)
+    {
+        fuse_log(FUSE_LOG_DEBUG, "unable to allocate args structure");
+    } else {
+        result->argc = argc;
+        unsigned int size = argc * sizeof( const char * );
+        result->argv = calloc(1, size);
+        if (result->argv != NULL)
         {
-            break;
+            for (int i = 0; i < argc; ++i)
+            {
+                result->argv[i] = strdup(argv[i]);
+            }
+            result->allocated = 1;
         }
-
-        d->entry  = NULL;
-        d->offset = nextoff;
-    }
-
-    return 0;
-}
-
-static int tmpl_releasedir( const char * path, struct fuse_file_info * fi )
-{
-    (void) path;
-
-    struct tmpl_dirp * d = get_dirp( fi );
-    closedir( d->dp );
-    free( d );
-
-    return 0;
-}
-
-static int tmpl_mknod( const char * path, mode_t mode, dev_t rdev )
-{
-    if ( S_ISFIFO( mode ) )
-    {
-        return( (mkfifo( path, mode ) == -1)? -errno : 0);
-    }
-    else
-    {
-        return( (mknod( path, mode, rdev ) == -1)? -errno : 0);
-    }
-}
-
-static int tmpl_mkdir( const char * path, mode_t mode )
-{
-    return( (mkdir( path, mode ) == -1)? -errno : 0);
-}
-
-static int tmpl_unlink( const char * path )
-{
-    return ( (unlink( path ) == -1)? -errno : 0);
-}
-
-static int tmpl_rmdir( const char * path )
-{
-    return ( (rmdir( path ) == -1)? -errno : 0 );
-}
-
-static int tmpl_symlink( const char * from, const char * to )
-{
-    return ( (symlink( from, to ) == -1)? -errno : 0);
-}
-
-static int tmpl_rename( const char * from, const char * to, unsigned int flags )
-{
-    /* When we have renameat2() in libc, then we can implement flags */
-    if ( flags )
-    {
-        return -EINVAL;
-    }
-
-    return ( (rename( from, to ) == -1)? -errno : 0);
-}
-
-static int tmpl_link( const char * from, const char * to )
-{
-    return ( (link( from, to ) == -1)? -errno : 0);
-}
-
-static int tmpl_chmod( const char * path, mode_t mode, struct fuse_file_info * fi )
-{
-    if ( fi )
-    {
-        return ( (fchmod( fi->fh, mode ) == -1)? -errno : 0);
-    }
-    else
-    {
-        return ( (chmod( path, mode ) == -1)? -errno : 0);
-    }
-}
-
-static int tmpl_chown( const char * path, uid_t uid, gid_t gid,
-                       struct fuse_file_info * fi )
-{
-    if ( fi )
-    {
-        return( (fchown( fi->fh, uid, gid ) == -1)? -errno : 0);
-    }
-    else
-    {
-        return( (lchown( path, uid, gid ) == -1)? -errno : 0);
-    }
-}
-
-static int tmpl_truncate( const char * path, off_t size,
-                          struct fuse_file_info * fi )
-{
-    if ( fi )
-    {
-        return( ( ftruncate( fi->fh, size ) == -1)? -errno : 0);
-    }
-    else
-    {
-        return( ( truncate( path, size ) == -1)? -errno : 0);
-    }
-}
-
-#ifdef HAVE_UTIMENSAT
-static int tmpl_utimens( const char *path,
-                         const struct timespec ts[2],
-                         struct fuse_file_info *fi)
-{
-    /* don't use utime/utimes since they follow symlinks */
-    if (fi)
-    {
-        return( (futimens(fi->fh, ts) == -1)? -errno : 0);
-    }
-    else
-    {
-        return( (utimensat(0, path, ts, AT_SYMLINK_NOFOLLOW) == -1)? -errno : 0);
-    }
-}
-#endif
-
-static int tmpl_create( const char * path, mode_t mode,
-                        struct fuse_file_info * fi )
-{
-    int fd = open( path, fi->flags, mode );
-    if ( fd == -1 )
-    {
-        return -errno;
-    }
-
-    fi->fh = fd;
-    return 0;
-}
-
-static int tmpl_open( const char * path, struct fuse_file_info * fi )
-{
-    int fd = open( path, fi->flags );
-    if ( fd == -1 )
-    {
-        return -errno;
-    }
-
-    fi->fh = fd;
-    return 0;
-}
-
-static int tmpl_read( const char * path,
-                      char * buf,
-                      size_t size,
-                      off_t offset,
-                      struct fuse_file_info * fi )
-{
-    (void) path;
-
-    int result = pread( fi->fh, buf, size, offset );
-    return( ( result == -1 )? -errno : result);
-}
-
-static int tmpl_read_buf( const char * path,
-                          struct fuse_bufvec ** bufp,
-                          size_t size,
-                          off_t offset,
-                          struct fuse_file_info * fi )
-{
-    struct fuse_bufvec * src;
-
-    (void) path;
-
-    src = malloc( sizeof( struct fuse_bufvec ));
-    if ( src == NULL)
-    {
-        return -ENOMEM;
-    }
-
-    *src = FUSE_BUFVEC_INIT( size );
-
-    src->buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
-    src->buf[0].fd    = fi->fh;
-    src->buf[0].pos   = offset;
-
-    *bufp = src;
-
-    return 0;
-}
-
-static int tmpl_write( const char * path, const char * buf, size_t size,
-                       off_t offset, struct fuse_file_info * fi )
-{
-    int result;
-
-    (void) path;
-
-    result = pwrite( fi->fh, buf, size, offset );
-    if ( result == -1 )
-    {
-        result = -errno;
     }
 
     return result;
 }
 
-static int tmpl_write_buf( const char * path, struct fuse_bufvec * buf,
-                           off_t offset, struct fuse_file_info * fi )
-{
-    struct fuse_bufvec dst = FUSE_BUFVEC_INIT( fuse_buf_size( buf ));
-
-    (void) path;
-
-    dst.buf[0].flags = FUSE_BUF_IS_FD | FUSE_BUF_FD_SEEK;
-    dst.buf[0].fd    = fi->fh;
-    dst.buf[0].pos   = offset;
-
-    return fuse_buf_copy( &dst, buf, FUSE_BUF_SPLICE_NONBLOCK );
-}
-
-static int tmpl_statfs( const char * path, struct statvfs * stbuf )
-{
-    return( (statvfs( path, stbuf ) == -1)? -errno : 0);
-}
-
-static int tmpl_flush( const char * path, struct fuse_file_info * fi )
-{
-    (void) path;
-
-    /* This is called from every close on an open file, so call the
-       close on the underlying filesystem.	But since flush may be
-       called multiple times for an open file, this must not really
-       close the file.  This is important if used on a network
-       filesystem like NFS which flush the data/metadata on close() */
-    return ( (close( dup( fi->fh )) == -1)? -errno : 0);
-}
-
-static int tmpl_release( const char * path, struct fuse_file_info * fi )
-{
-    (void) path;
-    close( fi->fh );
-
-    return 0;
-}
-
-static int tmpl_fsync( const char * path, int isdatasync, struct fuse_file_info * fi )
-{
-    int result;
-    (void) path;
-
-#ifndef HAVE_FDATASYNC
-    (void) isdatasync;
-#else
-    if (isdatasync)
-    {
-        result = fdatasync(fi->fh);
-    }
-    else
-#endif
-    {
-        result = fsync( fi->fh );
-    }
-
-    return( (result == -1)? -errno : 0 );
-}
-
-#ifdef HAVE_POSIX_FALLOCATE
-static int tmpl_fallocate( const char *path,
-                           int mode,
-                           off_t offset,
-                           off_t length,
-                           struct fuse_file_info *fi)
-{
-    (void)path;
-
-    if (mode) return -EOPNOTSUPP;
-
-    return -posix_fallocate(fi->fh, offset, length);
-}
-#endif
-
-#ifdef HAVE_SETXATTR
-/* xattr operations are optional and can safely be left unimplemented */
-static int tmpl_setxattr( const char *path,
-                          const char *name,
-                          const char *value,
-                          size_t size,
-                          int flags)
-{
-    return( (lsetxattr(path, name, value, size, flags) == -1)? -errno : 0);
-}
-
-static int tmpl_getxattr( const char *path,
-                          const char *name,
-                          char *value,
-                          size_t size)
-{
-    return( (lgetxattr(path, name, value, size) == -1)? -errno : 0);
-}
-
-static int tmpl_listxattr(const char *path, char *list, size_t size)
-{
-    return( (llistxattr(path, list, size) == -1)? -errno : 0);
-}
-
-static int tmpl_removexattr(const char *path, const char *name)
-{
-    return( (lremovexattr(path, name) == -1)? -errno : 0);
-}
-#endif /* HAVE_SETXATTR */
-
-#ifdef HAVE_LIBULOCKMGR
-static int tmpl_lock(const char *path, struct fuse_file_info *fi, int cmd,
-                    struct flock *lock)
-{
-    (void)path;
-
-    return ulockmgr_op(fi->fh, cmd, lock, &fi->lock_owner,
-                       sizeof(fi->lock_owner));
-}
-#endif
-
-static int tmpl_flock( const char * path, struct fuse_file_info * fi, int op )
-{
-    (void) path;
-
-    return( (flock( fi->fh, op ) == -1)? -errno : 0);
-}
-
-#ifdef HAVE_COPY_FILE_RANGE
-static ssize_t tmpl_copy_file_range( const char *path_in,
-                                     struct fuse_file_info *fi_in, off_t off_in,
-                                     const char *path_out,
-                                     struct fuse_file_info *fi_out, off_t off_out,
-                                     size_t len, int flags)
-{
-    ssize_t result;
-    (void)path_in;
-    (void)path_out;
-
-    result = copy_file_range(fi_in->fh, &off_in, fi_out->fh, &off_out, len, flags);
-    return( (result == -1)? -errno : 0);
-}
-#endif
-
-static off_t tmpl_lseek( const char * path, off_t off, int whence,
-                         struct fuse_file_info * fi )
-{
-    off_t result;
-    (void) path;
-
-    result = lseek( fi->fh, off, whence );
-    return( ( result == -1 )? -errno: result );
-}
-
-static const struct fuse_operations tmpl_oper = {
-        .init       = tmpl_init,
-        .getattr    = tmpl_getattr,
-        .access     = tmpl_access,
-        .readlink   = tmpl_readlink,
-        .opendir    = tmpl_opendir,
-        .readdir    = tmpl_readdir,
-        .releasedir = tmpl_releasedir,
-        .mknod      = tmpl_mknod,
-        .mkdir      = tmpl_mkdir,
-        .symlink    = tmpl_symlink,
-        .unlink     = tmpl_unlink,
-        .rmdir      = tmpl_rmdir,
-        .rename     = tmpl_rename,
-        .link       = tmpl_link,
-        .chmod      = tmpl_chmod,
-        .chown      = tmpl_chown,
-        .truncate   = tmpl_truncate,
-#ifdef HAVE_UTIMENSAT
-        .utimens    = tmpl_utimens,
-#endif
-        .create     = tmpl_create,
-        .open       = tmpl_open,
-        .read       = tmpl_read,
-        .read_buf   = tmpl_read_buf,
-        .write      = tmpl_write,
-        .write_buf  = tmpl_write_buf,
-        .statfs     = tmpl_statfs,
-        .flush      = tmpl_flush,
-        .release    = tmpl_release,
-        .fsync      = tmpl_fsync,
-#ifdef HAVE_POSIX_FALLOCATE
-        .fallocate  = tmpl_fallocate,
-#endif
-#ifdef HAVE_SETXATTR
-        .setxattr   = tmpl_setxattr,
-        .getxattr   = tmpl_getxattr,
-        .listxattr  = tmpl_listxattr,
-        .removexattr = tmpl_removexattr,
-#endif
-#ifdef HAVE_LIBULOCKMGR
-        .lock       = tmpl_lock,
-#endif
-        .flock      = tmpl_flock,
-#ifdef HAVE_COPY_FILE_RANGE
-        .copy_file_range = tmpl_copy_file_range,
-#endif
-        .lseek      = tmpl_lseek,
-};
-
+/**
+ * @brief main entry point
+ * @param argc  count of command line arguments
+ * @param argv  array of character pointers to the command line arguments
+ * @return exit code
+ */
+__attribute__((no_instrument_function))
 int main( int argc, char * argv[] )
 {
-    umask( 0 );
-    return fuse_main( argc, argv, &tmpl_oper, NULL );
+    int res;
+    struct fuse_args * args;
+    struct fuse * fuse;
+    struct fuse_cmdline_opts fuseOpts;
+
+    myName = strdup( basename(argv[0] ));
+    openlog( myName, LOG_PID, LOG_DAEMON);
+    fuse_set_log_func( log_to_syslog );
+
+    fuse_log( FUSE_LOG_INFO, "%s started", myName );
+
+    symbols = dlopen(NULL, RTLD_NOW );
+    if ( symbols == NULL)
+    {
+        fuse_log( FUSE_LOG_ERR, "unable to load symbols (%s)", dlerror());
+    }
+    else
+    {
+        fuse_log( FUSE_LOG_DEBUG, "symbols loaded at %p", symbols );
+    }
+
+    if ( fuse_version() < FUSE_USE_VERSION )
+    {
+        fprintf(stderr, "The FUSE API version (%d) is older than %s requires (%d).\nAborting...",
+                fuse_version(),
+                myName,
+                FUSE_USE_VERSION);
+        exit (-1);
+    }
+
+    /* work around some odd behaviors in libfuse - perhaps bugs? */
+    args = fuse_args_init( argc, argv );
+
+    /* first, let libfuse parse the common options from the command line */
+    if ( fuse_parse_cmdline( args, &fuseOpts ) == -1 )
+    {
+        fuse_log( FUSE_LOG_CRIT, "error: failed to parse command line" );
+        res = 1;
+    }
+    else
+    {
+        memset( &tmplOpts, 0, sizeof( tmplOpts ));
+        /* now extract options that are specific to templatefs */
+        if ( fuse_opt_parse( args, &tmplOpts, tmplCmdLineOptions, processTmplOpts ) == -1)
+        {
+            fuse_log( FUSE_LOG_CRIT, "error: failed to parse templatefs options");
+            res = 8;
+        } else {
+            if ( fuseOpts.show_version )
+            {
+                printf( "%s version %s\n", myName, PACKAGE_VERSION );
+
+                fuse_version();
+
+                res = 0;
+            }
+            else if ( fuseOpts.show_help )
+            {
+                if ( args->argv[0][0] != '\0' )
+                {
+                    printf( "usage: %s [options] <mountpoint>\n\n", myName );
+                }
+                printf( "FUSE options:\n" );
+
+                /* ToDo: add templatefs-specific options here */
+
+                fuse_lib_help( args );
+                res = 0;
+            }
+            else if ( !fuseOpts.mountpoint )
+            {
+                fuse_log( FUSE_LOG_CRIT, "error: no mountpoint specified" );
+                res = 2;
+            }
+            else
+            {
+                fuse_log( FUSE_LOG_INFO, "Mountpoint is \"%s\"", fuseOpts.mountpoint );
+
+                fuse_log( FUSE_LOG_DEBUG, "fuse_new(%p,%p,%u,%p)",
+                          args,
+                          &templatefsOperations,
+                          sizeof( templatefsOperations ),
+                          NULL);
+
+                fuse = fuse_new( args, &templatefsOperations, sizeof( templatefsOperations ), NULL);
+
+                if ( fuse == NULL)
+                {
+                    fuse_log( FUSE_LOG_CRIT, "error: fuse_new failed" );
+                    res = 3;
+                }
+                else
+                {
+                    if ( fuse_mount( fuse, fuseOpts.mountpoint ) != 0 )
+                    {
+                        fuse_log( FUSE_LOG_CRIT, "error: fuse_mount failed" );
+                        res = 4;
+                    }
+                    else
+                    {
+                        if ( fuse_daemonize( fuseOpts.foreground ) != 0 )
+                        {
+                            fuse_log( FUSE_LOG_CRIT, "error: fuse_daemonize failed" );
+                            res = 5;
+                        }
+                        else
+                        {
+                            struct fuse_session * se = fuse_get_session( fuse );
+
+                            if ( fuse_set_signal_handlers( se ) != 0 )
+                            {
+                                fuse_log( FUSE_LOG_CRIT, "error: fuse_set_signal_handlers failed" );
+                                res = 6;
+                            }
+                            else
+                            {
+                                if ( fuseOpts.singlethread )
+                                {
+                                    res = fuse_loop( fuse );
+                                }
+                                else
+                                {
+                                    struct fuse_loop_config loop_config;
+
+                                    loop_config.clone_fd         = fuseOpts.clone_fd;
+                                    loop_config.max_idle_threads = fuseOpts.max_idle_threads;
+                                    res = fuse_loop_mt( fuse, &loop_config );
+                                }
+                                if ( res != 0 )
+                                {
+                                    fuse_log( FUSE_LOG_CRIT, "error: fuse_loop failed" );
+                                    res = 7;
+                                }
+                                fuse_remove_signal_handlers( se );
+                            }
+                        }
+                        fuse_unmount( fuse );
+                    }
+                    fuse_destroy( fuse );
+                }
+                free( fuseOpts.mountpoint );
+            }
+        }
+    }
+    fuse_opt_free_args( args );
+
+    return res;
 }
