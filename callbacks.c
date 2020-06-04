@@ -4,16 +4,6 @@
 
 #include "templatefs.h"
 
-#include <stdio.h>
-#include <stdlib.h>
-#include <stddef.h>
-#include <unistd.h>
-#include <string.h>
-#include <fcntl.h>
-#include <errno.h>
-#include <sys/stat.h>
-#include <dirent.h>
-
 #ifdef HAVE_SETXATTR
 #include <sys/xattr.h>
 #endif
@@ -29,6 +19,7 @@
 typedef struct
 {
     int fd;
+    int isTemplate;
 } tFHFile;
 
 typedef struct
@@ -93,6 +84,12 @@ void clearHandle( struct fuse_file_info * fi )
 
 // ------------------------------------------------------------------------------
 
+static inline int isTemplate( char * path )
+{
+    return ( faccessat( globals.templates.fd, path, R_OK, AT_SYMLINK_NOFOLLOW ) == 0 );
+}
+
+// ------------------------------------------------------------------------------
 /**
  * Initialize filesystem
  *
@@ -101,7 +98,7 @@ void clearHandle( struct fuse_file_info * fi )
  * parameter to the destroy() method. It overrides the initial
  * value provided to fuse_main() / fuse_new().
  */
-void * op_init( struct fuse_conn_info * UNUSED( conn ), struct fuse_config * cfg )
+void * fs_init( struct fuse_conn_info * UNUSED( conn ), struct fuse_config * cfg )
 {
     LOG_ON_ENTRY( "(%p,%p)", conn, cfg );
 
@@ -132,7 +129,7 @@ void * op_init( struct fuse_conn_info * UNUSED( conn ), struct fuse_config * cfg
  * `fi` will always be NULL if the file is not currently open, but
  * may also be NULL if the file is open.
  */
-int op_getattr( const char * path, struct stat * stbuf, struct fuse_file_info * fi )
+int file_getattr( const char * path, struct stat * stbuf, struct fuse_file_info * fi )
 {
     LOG_ON_ENTRY( "(\"%s\", %p, %p)", path, stbuf, fi );
 
@@ -140,11 +137,11 @@ int op_getattr( const char * path, struct stat * stbuf, struct fuse_file_info * 
 
     if ( fh )
     {
-        return ((fstat( fh->fd, stbuf ) == -1)? -errno : 0);
+        return( (fstat( fh->fd, stbuf ) == -1)? -errno : 0);
     }
     else
     {
-        return ((lstat( path, stbuf ) == -1)? -errno : 0);
+        return( (fstatat( globals.mountpoint.fd, &path[1], stbuf, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW ) == -1)? -errno : 0);
     }
 }
 
@@ -157,10 +154,11 @@ int op_getattr( const char * path, struct stat * stbuf, struct fuse_file_info * 
  *
  * This method is not called under Linux kernel versions 2.4.x
  */
-int op_access( const char * path, int mask )
+int file_access( const char * path, int mask )
 {
     LOG_ON_ENTRY( "(\"%s\", %d)", path, mask );
-    return ((access( path, mask ) == -1)? -errno : 0);
+
+    return( (faccessat( globals.mountpoint.fd, &path[1], mask, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW ) == -1)? -errno : 0);
 }
 
 /** Read the target of a symbolic link
@@ -171,13 +169,13 @@ int op_access( const char * path, int mask )
  * buffer, it should be truncated.	The return value should be 0
  * for success.
  */
-int op_readlink( const char * path, char * buf, size_t size )
+int obj_readlink( const char * path, char * buf, size_t size )
 {
     int result;
 
     LOG_ON_ENTRY( "(\"%s\", %p, %d)", path, buf, size );
 
-    result = readlink( path, buf, size - 1 );
+    result = readlinkat( globals.mountpoint.fd, &path[1], buf, size - 1 );
     if ( result == -1 )
     {
         return -errno;
@@ -195,8 +193,10 @@ int op_readlink( const char * path, char * buf, size_t size )
  * filehandle in the fuse_file_info structure, which will be
  * passed to readdir, releasedir and fsyncdir.
  */
-int op_opendir( const char * path, struct fuse_file_info * fi )
+int dir_open( const char * path, struct fuse_file_info * fi )
 {
+    int fd;
+
     LOG_ON_ENTRY( "(\"%s\",%p)", path, fi );
 
     tFHDir * fh = (tFHDir *) malloc( sizeof( tFileHandle ));
@@ -206,17 +206,41 @@ int op_opendir( const char * path, struct fuse_file_info * fi )
         return -ENOMEM;
     }
 
-    fh->dp = opendir( path );
-    if ( fh->dp == NULL )
+    if ( strcmp(path,"/") == 0 )
     {
-        int result = -errno;
-        free( fh );
-        return result;
+        fd = dup(globals.mountpoint.fd);
+        if ( lseek( fd, 0, SEEK_SET ) == -1)
+        {
+            fuse_log( FUSE_LOG_ERR, "error: lseek failed (%d: %s)", errno, strerror(errno) );
+            return -errno;
+        }
     }
-    fh->offset = 0;
-    fh->entry  = NULL;
+    else
+    {
+        fd = openat( globals.mountpoint.fd, &path[1], O_RDONLY );
+    }
 
-    setDirHandle( fi, fh );
+    if ( fd == -1 )
+    {
+        fuse_log(FUSE_LOG_ERR, "file descriptor is invalid (%d: %s)", errno, strerror(errno) );
+        return -errno;
+    }
+    else
+    {
+        fh->dp = fdopendir( fd );
+        if ( fh->dp == NULL)
+        {
+            fuse_log( FUSE_LOG_ERR, "failed to open directory \"%s\"", path );
+            int result = -errno;
+            free( fh );
+            return result;
+        }
+        fh->offset = 0;
+        fh->entry  = NULL;
+
+        setDirHandle( fi, fh );
+    }
+
     return 0;
 }
 
@@ -235,12 +259,12 @@ int op_opendir( const char * path, struct fuse_file_info * fi )
  * is full (or an error happens) the filler function will return
  * '1'.
  */
-int op_readdir( const char * UNUSED( path ),
-                void * buf,
-                fuse_fill_dir_t filler,
-                off_t offset,
-                struct fuse_file_info * fi,
-                enum fuse_readdir_flags flags )
+int dir_read( const char * UNUSED( path ),
+              void * buf,
+              fuse_fill_dir_t filler,
+              off_t offset,
+              struct fuse_file_info * fi,
+              enum fuse_readdir_flags flags )
 {
     LOG_ON_ENTRY( "(\"%s\",%p)", path, fi );
 
@@ -281,7 +305,7 @@ int op_readdir( const char * UNUSED( path ),
         if (flags & FUSE_READDIR_PLUS) {
             int result;
 
-            result = fstatat( dirfd(d->dp), d->entry->d_name, &st, AT_SYMLINK_NOFOLLOW);
+            result = fstatat( dirfd(d->dp), d->entry->d_name, &st, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW);
             if (result != -1)
             {
                 fill_flags |= FUSE_FILL_DIR_PLUS;
@@ -315,7 +339,7 @@ int op_readdir( const char * UNUSED( path ),
 }
 
 /** Release directory */
-int op_releasedir( const char * UNUSED( path ), struct fuse_file_info * fi )
+int dir_release( const char * UNUSED( path ), struct fuse_file_info * fi )
 {
     LOG_ON_ENTRY( "(\"%s\",%p)", path, fi );
 
@@ -323,6 +347,7 @@ int op_releasedir( const char * UNUSED( path ), struct fuse_file_info * fi )
     if ( fh != NULL && fh->dp != NULL )
     {
         closedir( fh->dp );
+        fh->dp = NULL;
     }
     clearHandle( fi );
 
@@ -335,17 +360,17 @@ int op_releasedir( const char * UNUSED( path ), struct fuse_file_info * fi )
  * nodes.  If the filesystem defines a create() method, then for
  * regular files that will be called instead.
  */
-int op_mknod( const char * path, mode_t mode, dev_t rdev )
+int obj_mknod( const char * path, mode_t mode, dev_t rdev )
 {
     LOG_ON_ENTRY( "(\"%s\",%d,%d)", path, mode, rdev );
 
     if ( S_ISFIFO( mode ))
     {
-        return ((mkfifo( path, mode ) == -1)? -errno : 0);
+        return( (mkfifoat( globals.mountpoint.fd, &path[1], mode ) == -1)? -errno : 0);
     }
     else
     {
-        return ((mknod( path, mode, rdev ) == -1)? -errno : 0);
+        return( (mknodat( globals.mountpoint.fd, &path[1], mode, rdev ) == -1)? -errno : 0);
     }
 }
 
@@ -355,35 +380,35 @@ int op_mknod( const char * path, mode_t mode, dev_t rdev )
  * bits set, i.e. S_ISDIR(mode) can be false.  To obtain the
  * correct directory type bits use  mode|S_IFDIR
  */
-int op_mkdir( const char * path, mode_t mode )
+int dir_create( const char * path, mode_t mode )
 {
     LOG_ON_ENTRY( "(\"%s\",%d)", path, mode );
 
-    return ((mkdir( path, mode ) == -1)? -errno : 0);
+    return( (mkdirat( globals.mountpoint.fd, &path[1], mode ) == -1)? -errno : 0);
 }
 
 /** Remove a file */
-int op_unlink( const char * path )
+int file_unlink( const char * path )
 {
     LOG_ON_ENTRY( "(\"%s\")", path );
 
-    return ((unlink( path ) == -1)? -errno : 0);
+    return( (unlinkat( globals.mountpoint.fd, &path[1], 0 ) == -1)? -errno : 0);
 }
 
 /** Remove a directory */
-int op_rmdir( const char * path )
+int dir_remove( const char * path )
 {
     LOG_ON_ENTRY( "(\"%s\")", path );
 
-    return ((rmdir( path ) == -1)? -errno : 0);
+    return( (unlinkat( globals.mountpoint.fd, &path[1], AT_REMOVEDIR ) == -1)? -errno : 0);
 }
 
 /** Create a symbolic link */
-int op_symlink( const char * from, const char * to )
+int obj_symlink( const char * from, const char * to )
 {
     LOG_ON_ENTRY( "(\"%s\",\"%s\")", from, to );
 
-    return ((symlink( from, to ) == -1)? -errno : 0);
+    return( (symlinkat( from, globals.mountpoint.fd, &to[1] ) == -1)? -errno : 0);
 }
 
 /** Rename a file
@@ -395,7 +420,7 @@ int op_symlink( const char * from, const char * to )
  * must atomically exchange the two files, i.e. both must
  * exist and neither may be deleted.
  */
-int op_rename( const char * from, const char * to, unsigned int flags )
+int obj_rename( const char * from, const char * to, unsigned int flags )
 {
     LOG_ON_ENTRY( "(\"%s\",\"%s\",%u)", from, to, flags );
 
@@ -405,15 +430,16 @@ int op_rename( const char * from, const char * to, unsigned int flags )
         return -EINVAL;
     }
 
-    return ((rename( from, to ) == -1)? -errno : 0);
+    return( (renameat( globals.mountpoint.fd, &from[1], globals.mountpoint.fd, &to[1] ) == -1)? -errno : 0);
 }
 
 /** Create a hard link to a file */
-int op_link( const char * from, const char * to )
+int file_link( const char * from, const char * to )
 {
+    /* ToDo: fixup from and to */
     LOG_ON_ENTRY( "(\"%s\",\"%s\")", from, to );
 
-    return ((link( from, to ) == -1)? -errno : 0);
+    return( (linkat( globals.mountpoint.fd, &from[1], globals.mountpoint.fd, &to[1], 0 ) == -1)? -errno : 0);
 }
 
 /** Change the permission bits of a file
@@ -421,18 +447,18 @@ int op_link( const char * from, const char * to )
  * `fi` will always be NULL if the file is not currenlty open, but
  * may also be NULL if the file is open.
  */
-int op_chmod( const char * path, mode_t mode, struct fuse_file_info * fi )
+int obj_chmod( const char * path, mode_t mode, struct fuse_file_info * fi )
 {
     LOG_ON_ENTRY( "(\"%s\",%p,%p)", path, mode, fi );
 
     tFHFile * fh = getFileHandle( fi );
     if ( fh )
     {
-        return ((fchmod( fh->fd, mode ) == -1)? -errno : 0);
+        return( (fchmod( fh->fd, mode ) == -1)? -errno : 0);
     }
     else
     {
-        return ((chmod( path, mode ) == -1)? -errno : 0);
+        return( (fchmodat( globals.mountpoint.fd, &path[1], mode, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW ) == -1)? -errno : 0);
     }
 }
 
@@ -444,18 +470,18 @@ int op_chmod( const char * path, mode_t mode, struct fuse_file_info * fi )
  * Unless FUSE_CAP_HANDLE_KILLPRIV is disabled, this method is
  * expected to reset the setuid and setgid bits.
  */
-int op_chown( const char * path, uid_t uid, gid_t gid, struct fuse_file_info * fi )
+int obj_chown( const char * path, uid_t uid, gid_t gid, struct fuse_file_info * fi )
 {
     LOG_ON_ENTRY( "(\"%s\",%u,%u,%p)", path, uid, gid, fi );
 
     tFHFile * fh = getFileHandle( fi );
     if ( fh )
     {
-        return ((fchown( fh->fd, uid, gid ) == -1)? -errno : 0);
+        return( (fchown( fh->fd, uid, gid ) == -1)? -errno : 0);
     }
     else
     {
-        return ((lchown( path, uid, gid ) == -1)? -errno : 0);
+        return( (fchownat( globals.mountpoint.fd, &path[1], uid, gid, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW ) == -1)? -errno : 0);
     }
 }
 
@@ -467,19 +493,26 @@ int op_chown( const char * path, uid_t uid, gid_t gid, struct fuse_file_info * f
  * Unless FUSE_CAP_HANDLE_KILLPRIV is disabled, this method is
  * expected to reset the setuid and setgid bits.
  */
-int op_truncate( const char * path, off_t size,
-                 struct fuse_file_info * fi )
+int file_truncate( const char * path, off_t size,
+                   struct fuse_file_info * fi )
 {
     LOG_ON_ENTRY( "(\"%s\",%u,%p)", path, size, fi );
 
-    tFHFile * fh = getFileHandle( fi );
-    if ( fh )
+    if ( fi == NULL )
     {
-        return ((ftruncate( fh->fd, size ) == -1)? -errno : 0);
+        fuse_log( FUSE_LOG_ERR, "attempt to truncate \"%s\" with null fuse_file_info", path);
+        return -EINVAL;
     }
     else
     {
-        return ((truncate( path, size ) == -1)? -errno : 0);
+        tFHFile * fh = getFileHandle( fi );
+        if (fh == NULL)
+        {
+            fuse_log( FUSE_LOG_ERR, "attempt to truncate \"%s\" with invalid fileHandle", path );
+            return -EINVAL;
+        }
+
+        return ((ftruncate( fh->fd, size ) == -1)? -errno : 0);
     }
 }
 
@@ -496,7 +529,7 @@ int op_truncate( const char * path, off_t size,
  *
  * See the utimensat(2) man page for details.
  */
-int op_utimens( const char *path,
+int file_utimens( const char *path,
                          const struct timespec ts[2],
                          struct fuse_file_info *fi)
 {
@@ -507,7 +540,7 @@ int op_utimens( const char *path,
     }
     else
     {
-        return( (utimensat(0, path, ts, AT_SYMLINK_NOFOLLOW) == -1)? -errno : 0);
+        return( (utimensat(0, path, ts, AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW) == -1)? -errno : 0);
     }
 }
 #endif
@@ -522,7 +555,7 @@ int op_utimens( const char *path,
  * versions earlier than 2.6.15, the mknod() and open() methods
  * will be called instead.
  */
-int op_create( const char * path, mode_t mode, struct fuse_file_info * fi )
+int file_create( const char * path, mode_t mode, struct fuse_file_info * fi )
 {
     LOG_ON_ENTRY( "(\"%s\",%u,%p)", path, mode, fi );
 
@@ -533,7 +566,7 @@ int op_create( const char * path, mode_t mode, struct fuse_file_info * fi )
         return -ENOMEM;
     }
 
-    int fd = open( path, fi->flags, mode );
+    int fd = openat( globals.mountpoint.fd, &path[1], fi->flags, mode );
     if ( fd == -1 )
     {
         return -errno;
@@ -547,8 +580,7 @@ int op_create( const char * path, mode_t mode, struct fuse_file_info * fi )
 
 /** Open a file
  *
- * Open flags are available in fi->flags. The following rules
- * apply.
+ * Open flags are available in fi->flags. The following rules apply:
  *
  *  - Creation (O_CREAT, O_EXCL, O_NOCTTY) flags will be
  *    filtered out / handled by the kernel.
@@ -574,28 +606,23 @@ int op_create( const char * path, mode_t mode, struct fuse_file_info * fi )
  *    (and let the kernel handle it), or return an error
  *    (indicating that reliably O_APPEND is not available).
  *
- * Filesystem may store an arbitrary file handle (pointer,
- * index, etc) in fi->fh, and use this in other all other file
- * operations (read, write, flush, release, fsync).
+ * Filesystem may store an arbitrary file handle (pointer, index, etc) in fi->fh, and
+ * use this in other all other file operations (read, write, flush, release, fsync).
  *
- * Filesystem may also implement stateless file I/O and not store
- * anything in fi->fh.
+ * Filesystem may also implement stateless file I/O and not store anything in fi->fh.
  *
- * There are also some flags (direct_io, keep_cache) which the
- * filesystem may set in fi, to change the way the file is opened.
- * See fuse_file_info structure in <fuse_common.h> for more details.
+ * There are also some flags (direct_io, keep_cache) which the filesystem may set in fi,
+ * to change the way the file is opened. See fuse_file_info structure in <fuse_common.h>
+ * for more details.
  *
- * If this request is answered with an error code of ENOSYS
- * and FUSE_CAP_NO_OPEN_SUPPORT is set in
- * `fuse_conn_info.capable`, this is treated as success and
- * future calls to open will also succeed without being send
- * to the filesystem process.
+ * If this request is answered with an error code of ENOSYS and FUSE_CAP_NO_OPEN_SUPPORT
+ * is set in  `fuse_conn_info.capable`, this is treated as success and future calls to
+ * open will also succeed without being send to the filesystem process.
  *
  */
-int op_open( const char * path, struct fuse_file_info * fi )
+int file_open( const char * path, struct fuse_file_info * fi )
 {
     int  fd;
-    char template[PATH_MAX];
 
     LOG_ON_ENTRY( "(\"%s\", %p)", path, fi );
 
@@ -605,16 +632,19 @@ int op_open( const char * path, struct fuse_file_info * fi )
         return -ENOMEM;
     }
 
-    strncpy( template, "/var/etc/", sizeof( template ));
-    strncat( template, path, sizeof( template ) - strlen( template ) - 1 );
-    if ( access( template, R_OK ) != 0 )
+    fh->isTemplate = isTemplate( path );
+
+    if ( fh->isTemplate )
     {
-        fd = open( template, fi->flags );
-        /* process template file */
+        fuse_log( FUSE_LOG_DEBUG,"opening template \"%s\"", path );
+        fd = openat( globals.templates.fd, &path[1], fi->flags );
+
+        /* ToDo: process template file */
     }
     else
     {
-        fd = open( path, fi->flags );
+        fuse_log( FUSE_LOG_DEBUG, "opening file \"%s\"", path );
+        fd = openat( globals.mountpoint.fd, &path[1], fi->flags );
     }
     if ( fd == -1 )
     {
@@ -635,13 +665,14 @@ int op_open( const char * path, struct fuse_file_info * fi )
  * value of the read system call will reflect the return value of
  * this operation.
  */
-int op_read( const char * UNUSED( path ),
-             char * buf,
-             size_t size,
-             off_t offset,
-             struct fuse_file_info * fi )
+int file_read( const char * UNUSED( path ),
+               char * buf,
+               size_t size,
+               off_t offset,
+               struct fuse_file_info * fi )
 {
     LOG_ON_ENTRY( "(\"%s\", %p)", path, fi );
+
     tFHFile * fh = getFileHandle( fi );
     if ( fh == NULL )
     {
@@ -649,7 +680,7 @@ int op_read( const char * UNUSED( path ),
     }
 
     int result = pread( fh->fd, buf, size, offset );
-    return ((result == -1)? -errno : result);
+    return( (result == -1)? -errno : result);
 }
 
 /** Store data from an open file in a buffer
@@ -666,11 +697,11 @@ int op_read( const char * UNUSED( path ),
  * regions, they too must be allocated using malloc().  The
  * allocated memory will be freed by the caller.
  */
-int op_read_buf( const char * UNUSED( path ),
-                 struct fuse_bufvec ** bufp,
-                 size_t size,
-                 off_t offset,
-                 struct fuse_file_info * fi )
+int file_read_buf( const char * UNUSED( path ),
+                   struct fuse_bufvec ** bufp,
+                   size_t size,
+                   off_t offset,
+                   struct fuse_file_info * fi )
 {
     struct fuse_bufvec * src;
 
@@ -708,8 +739,8 @@ int op_read_buf( const char * UNUSED( path ),
  * Unless FUSE_CAP_HANDLE_KILLPRIV is disabled, this method is
  * expected to reset the setuid and setgid bits.
  */
-int op_write( const char * UNUSED( path ), const char * buf, size_t size,
-              off_t offset, struct fuse_file_info * fi )
+int file_write( const char * UNUSED( path ), const char * buf, size_t size,
+                off_t offset, struct fuse_file_info * fi )
 {
     int result;
 
@@ -739,7 +770,7 @@ int op_write( const char * UNUSED( path ), const char * buf, size_t size,
  * Unless FUSE_CAP_HANDLE_KILLPRIV is disabled, this method is
  * expected to reset the setuid and setgid bits.
  */
-int op_write_buf( const char * UNUSED( path ), struct fuse_bufvec * buf, off_t offset, struct fuse_file_info * fi )
+int file_write_buf( const char * UNUSED( path ), struct fuse_bufvec * buf, off_t offset, struct fuse_file_info * fi )
 {
     struct fuse_bufvec dst = FUSE_BUFVEC_INIT( fuse_buf_size( buf ));
 
@@ -762,11 +793,11 @@ int op_write_buf( const char * UNUSED( path ), struct fuse_bufvec * buf, off_t o
  *
  * The 'f_favail', 'f_fsid' and 'f_flag' fields are ignored
  */
-int op_statfs( const char * path, struct statvfs * stbuf )
+int obj_statfs( const char * path, struct statvfs * stbuf )
 {
     LOG_ON_ENTRY( "(\"%s\",%p)", path, stbuf );
 
-    return ((statvfs( path, stbuf ) == -1)? -errno : 0);
+    return( (statvfs( path, stbuf ) == -1)? -errno : 0);
 }
 
 /** Possibly flush cached data
@@ -797,7 +828,7 @@ int op_statfs( const char * path, struct statvfs * stbuf )
  *
  * [close]: http://pubs.opengroup.org/onlinepubs/9699919799/functions/close.html
  */
-int op_flush( const char * UNUSED( path ), struct fuse_file_info * fi )
+int file_flush( const char * UNUSED( path ), struct fuse_file_info * fi )
 {
     LOG_ON_ENTRY( "(\"%s\",%p)", path, fi );
 
@@ -812,7 +843,7 @@ int op_flush( const char * UNUSED( path ), struct fuse_file_info * fi )
      * an open file, this must not really close the file.  This is important if
      * used on a network filesystem like NFS which flush the data/metadata on
      * close() */
-    return ((close( dup( fh->fd )) == -1)? -errno : 0);
+    return( (close( dup( fh->fd )) == -1)? -errno : 0);
 }
 
 /** Release an open file
@@ -827,7 +858,7 @@ int op_flush( const char * UNUSED( path ), struct fuse_file_info * fi )
  * release will mean, that no more reads/writes will happen on the
  * file.  The return value of release is ignored.
  */
-int op_release( const char * UNUSED( path ), struct fuse_file_info * fi )
+int file_release( const char * UNUSED( path ), struct fuse_file_info * fi )
 {
     LOG_ON_ENTRY( "(\"%s\",%p)", path, fi );
 
@@ -848,7 +879,7 @@ int op_release( const char * UNUSED( path ), struct fuse_file_info * fi )
  * If the datasync parameter is non-zero, then only the user data
  * should be flushed, not the meta data.
  */
-int op_fsync( const char * UNUSED( path ), int UNUSED( isdatasync ), struct fuse_file_info * fi )
+int file_fsync( const char * UNUSED( path ), int UNUSED( isdatasync ), struct fuse_file_info * fi )
 {
     int result;
 
@@ -871,7 +902,7 @@ int op_fsync( const char * UNUSED( path ), int UNUSED( isdatasync ), struct fuse
         result = fsync( fh->fd );
     }
 
-    return ((result == -1)? -errno : 0);
+    return( (result == -1)? -errno : 0);
 }
 
 #ifdef HAVE_POSIX_FALLOCATE
@@ -883,7 +914,7 @@ int op_fsync( const char * UNUSED( path ), int UNUSED( isdatasync ), struct fuse
  * request to specified range is guaranteed not to fail because of lack
  * of space on the file system media.
  */
-int op_fallocate( const char *UNUSED(path),
+int file_fallocate( const char *UNUSED(path),
                          int mode,
                          off_t offset,
                          off_t length,
@@ -908,7 +939,7 @@ int op_fallocate( const char *UNUSED(path),
 /* xattr operations are optional and can safely be left unimplemented */
 
 /** Set extended attributes */
-int op_setxattr( const char *path,
+int file_setxattr( const char *path,
                         const char *name,
                         const char *value,
                         size_t size,
@@ -918,7 +949,7 @@ int op_setxattr( const char *path,
 }
 
 /** Get extended attributes */
-int op_getxattr( const char *path,
+int file_getxattr( const char *path,
                         const char *name,
                         char *value,
                         size_t size)
@@ -927,13 +958,13 @@ int op_getxattr( const char *path,
 }
 
 /** List extended attributes */
-int op_listxattr(const char *path, char *list, size_t size)
+int file_listxattr(const char *path, char *list, size_t size)
 {
     return( (llistxattr(path, list, size) == -1)? -errno : 0);
 }
 
 /** Remove extended attributes */
-int op_removexattr(const char *path, const char *name)
+int file_removexattr(const char *path, const char *name)
 {
     return( (lremovexattr(path, name) == -1)? -errno : 0);
 }
@@ -970,7 +1001,7 @@ int op_removexattr(const char *path, const char *name)
  * allow file locking to work locally.  Hence it is only
  * interesting for network filesystems and similar.
  */
-int op_lock(const char *UNUSED(path), struct fuse_file_info *fi, int cmd, struct flock *lock)
+int file_lock(const char *UNUSED(path), struct fuse_file_info *fi, int cmd, struct flock *lock)
 {
     tFHFile * fh = getFileHandle( fi );
     if ( fh == NULL)
@@ -1000,7 +1031,7 @@ int op_lock(const char *UNUSED(path), struct fuse_file_info *fi, int cmd, struct
  * allow file locking to work locally.  Hence it is only
  * interesting for network filesystems and similar.
  */
-int op_flock( const char * UNUSED( path ), struct fuse_file_info * fi, int op )
+int file_flock( const char * UNUSED( path ), struct fuse_file_info * fi, int op )
 {
     LOG_ON_ENTRY( "(\"%s\",%p,%u)", path, fi, op );
 
@@ -1010,7 +1041,7 @@ int op_flock( const char * UNUSED( path ), struct fuse_file_info * fi, int op )
         return -ENFILE;
     }
 
-    return ((flock( fh->fd, op ) == -1)? -errno : 0);
+    return ( (flock( fh->fd, op ) == -1)? -errno : 0);
 }
 
 #ifdef HAVE_COPY_FILE_RANGE
@@ -1026,11 +1057,11 @@ int op_flock( const char * UNUSED( path ), struct fuse_file_info * fi, int op )
  * emulation automatically, but the emulation has been removed from all
  * glibc release branches.)
  */
-ssize_t op_copy_file_range( const char * UNUSED(path_in),
-                                   struct fuse_file_info *fi_in, off_t off_in,
-                                   const char * UNUSED(path_out),
-                                   struct fuse_file_info *fi_out, off_t off_out,
-                                   size_t len, int flags)
+ssize_t file_copy_range( const char * UNUSED(path_in),
+                         struct fuse_file_info *fi_in, off_t off_in,
+                         const char * UNUSED(path_out),
+                         struct fuse_file_info *fi_out, off_t off_out,
+                         size_t len, int flags)
 {
     ssize_t result;
     tFHFile * fh_in = getFileHandle( fi_in );
@@ -1051,7 +1082,7 @@ ssize_t op_copy_file_range( const char * UNUSED(path_in),
 #endif
 
 /** Find next data or hole after the specified offset */
-off_t op_lseek( const char * UNUSED( path ), off_t off, int whence, struct fuse_file_info * fi )
+off_t file_lseek( const char * UNUSED( path ), off_t off, int whence, struct fuse_file_info * fi )
 {
     off_t result;
 
@@ -1065,55 +1096,55 @@ off_t op_lseek( const char * UNUSED( path ), off_t off, int whence, struct fuse_
 
     result = lseek( fh->fd, off, whence );
 
-    return ((result == -1)? -errno : result);
+    return ( (result == -1)? -errno : result);
 }
 
 const struct fuse_operations templatefsOperations = {
-        .init       = op_init,
-        .getattr    = op_getattr,
-        .access     = op_access,
-        .readlink   = op_readlink,
-        .opendir    = op_opendir,
-        .readdir    = op_readdir,
-        .releasedir = op_releasedir,
-        .mknod      = op_mknod,
-        .mkdir      = op_mkdir,
-        .symlink    = op_symlink,
-        .unlink     = op_unlink,
-        .rmdir      = op_rmdir,
-        .rename     = op_rename,
-        .link       = op_link,
-        .chmod      = op_chmod,
-        .chown      = op_chown,
-        .truncate   = op_truncate,
+        .init            = fs_init,
+        .getattr         = file_getattr,
+        .access          = file_access,
+        .readlink        = obj_readlink,
+        .opendir         = dir_open,
+        .readdir         = dir_read,
+        .releasedir      = dir_release,
+        .mknod           = obj_mknod,
+        .mkdir           = dir_create,
+        .symlink         = obj_symlink,
+        .unlink          = file_unlink,
+        .rmdir           = dir_remove,
+        .rename          = obj_rename,
+        .link            = file_link,
+        .chmod           = obj_chmod,
+        .chown           = obj_chown,
+        .truncate        = file_truncate,
 #ifdef HAVE_UTIMENSAT
-        .utimens    = op_utimens,
+        .utimens         = file_utimens,
 #endif
-        .create     = op_create,
-        .open       = op_open,
-        .read       = op_read,
-        .read_buf   = op_read_buf,
-        .write      = op_write,
-        .write_buf  = op_write_buf,
-        .statfs     = op_statfs,
-        .flush      = op_flush,
-        .release    = op_release,
-        .fsync      = op_fsync,
+        .create          = file_create,
+        .open            = file_open,
+        .read            = file_read,
+        .read_buf        = file_read_buf,
+        .write           = file_write,
+        .write_buf       = file_write_buf,
+        .statfs          = obj_statfs,
+        .flush           = file_flush,
+        .release         = file_release,
+        .fsync           = file_fsync,
 #ifdef HAVE_POSIX_FALLOCATE
-        .fallocate  = op_fallocate,
+        .fallocate       = file_fallocate,
 #endif
 #ifdef HAVE_SETXATTR
-        .setxattr   = op_setxattr,
-        .getxattr   = op_getxattr,
-        .listxattr  = op_listxattr,
-        .removexattr = op_removexattr,
+        .setxattr        = file_setxattr,
+        .getxattr        = file_getxattr,
+        .listxattr       = file_listxattr,
+        .removexattr     = file_removexattr,
 #endif
 #ifdef HAVE_LIBULOCKMGR
-        .lock       = op_lock,
+        .lock            = file_lock,
 #endif
-        .flock      = op_flock,
+        .flock           = file_flock,
 #ifdef HAVE_COPY_FILE_RANGE
-        .copy_file_range = op_copy_file_range,
+        .copy_file_range = file_copy_range,
 #endif
-        .lseek      = op_lseek,
+        .lseek           = file_lseek,
 };
