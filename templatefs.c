@@ -1,28 +1,31 @@
 /*
-    derived from passthrough_fh.c, part of the libfuse project.
-    See https://github.com/libfuse/libfuse/blob/master/example/passthrough_fh.c
-
-    The original is distributed under the terms of the GNU GPLv2.
-    Since this counts as a 'derivative work', it is also provided
-    under the terms of GPL v2.
-
     Copyright (c) Paul Chambers, 2020. All rights reserved.
 */
 
-/** @file
+/**
+ * @file templatefs.c
  *
- * This file system mirrors the existing file system hierarchy of the
- * system, starting at the root file system. This is implemented by
- * just "passing through" all requests to the corresponding user-space
- * libc functions. This implementation is a little more sophisticated
- * than the one in passthrough.c, so performance is not quite as bad.
+ * This file system mirrors the existing file system hierarchy of the system,
+ * starting at the mount point.
+ *
+ * When a file is opened, a second hierarchy is checked to see if there's a
+ * corresponding template file.
+ *
+ * ## If a template file exists ##
+ *    it is processed using the mustach templating engine, using values obtained
+ *    from libelektra. The resulting output is cached and used to satify any reads
+ *    that follow. The cache is discarded when the file is released.
+ *
+ * ## If there is no template file ##
+ *    The operations are transparently passed through to the underlying file,
+ *    much like overlayfs works when there's no 'upper' file, except the
+ *    'lower' files are writable.
  *
  * ## Source code ##
- * \include templatefs.c
+ * @include templatefs.c
  */
 
-
-
+#include "common.h"
 #include "templatefs.h"
 
 #ifdef HAVE_LIBULOCKMGR
@@ -37,18 +40,27 @@
 #include <fuse3/fuse_lowlevel.h>
 #include <fuse3/fuse_common.h>
 #include <fuse3/fuse_opt.h>
+
 #ifdef INSTRUMENT_FUNCTIONS
 #include <dlfcn.h>
 #endif
 
-#include "callbacks.h"
+#include "fuseOperations.h"
 
-#define PACKAGE_VERSION "1.0"
+#define VERSION "0.2"
 
-#define UNUSED(arg) __attribute__((unused)) arg
+typedef struct
+{
+    char * templates;
+} tTemplateOptions;
 
-tGlobals globals;
+struct
+{
+    const char * myName;        // the name used to start this executable
 
+    struct fuse_cmdline_opts options;
+    tTemplateOptions template;
+} globals;
 
 // ------------------------------------------------------------------------------
 
@@ -56,8 +68,7 @@ tGlobals globals;
 
 const struct fuse_opt tmplCmdLineOptions[] =
 {
-        MOUNT_OPT( "templates=%s",    templates,    0 ),
-
+        MOUNT_OPT( "templates=%s", templates,    0 ),
         FUSE_OPT_END
 };
 
@@ -144,21 +155,24 @@ int lightFuse( struct fuse_args * args )
               sizeof( templatefsOperations ),
               NULL);
 
-    fuse = fuse_new( args, &templatefsOperations, sizeof( templatefsOperations ), NULL);
+    fuse = fuse_new( args,
+                     &templatefsOperations, sizeof( templatefsOperations ),
+                     initPrivateData( globals.options.mountpoint,
+                                      globals.template.templates ) );
 
     if ( fuse == NULL)
     {
         fuse_log( FUSE_LOG_CRIT, "error: fuse_new failed" );
         result = 3;
     }
-    else if ( fuse_mount( fuse, globals.mountpoint.path ) != 0 )
+    else if ( fuse_mount( fuse, globals.options.mountpoint ) != 0 )
     {
         fuse_log( FUSE_LOG_CRIT, "error: fuse_mount failed" );
         result = 4;
     }
     else
     {
-        if ( fuse_daemonize( globals.options.common.foreground ) != 0 )
+        if ( fuse_daemonize( globals.options.foreground ) != 0 )
         {
             fuse_log( FUSE_LOG_CRIT, "error: fuse_daemonize failed" );
             result = 5;
@@ -174,7 +188,7 @@ int lightFuse( struct fuse_args * args )
             }
             else
             {
-                if ( globals.options.common.singlethread )
+                if ( globals.options.singlethread )
                 {
                     result = fuse_loop( fuse );
                 }
@@ -182,8 +196,8 @@ int lightFuse( struct fuse_args * args )
                 {
                     struct fuse_loop_config loop_config;
 
-                    loop_config.clone_fd         = globals.options.common.clone_fd;
-                    loop_config.max_idle_threads = globals.options.common.max_idle_threads;
+                    loop_config.clone_fd         = globals.options.clone_fd;
+                    loop_config.max_idle_threads = globals.options.max_idle_threads;
                     result = fuse_loop_mt( fuse, &loop_config );
                 }
                 if ( result != 0 )
@@ -207,36 +221,6 @@ void log_to_syslog( enum fuse_log_level level, const char * fmt, va_list ap )
     vsyslog( level, fmt, ap );
 }
 
-int setupFSTree( tFSTree * tree, char * path )
-{
-    int result;
-
-    tree->path = realpath( path, NULL);
-    if ( tree->path == NULL || access( tree->path, F_OK ) != 0 )
-    {
-        fuse_log( FUSE_LOG_CRIT,
-                  "error: path \"%s\" is invalid", tree->path );
-        result = -errno;
-    }
-    else
-    {
-        fuse_log( FUSE_LOG_INFO,
-                  "path is \"%s\"", tree->path );
-
-        tree->fd = -1;
-        tree->dir = opendir( tree->path );
-        if ( tree->dir != NULL)
-        {
-            tree->fd = dirfd( tree->dir );
-        }
-        if ( tree->fd == -1 )
-        {
-            result = -errno;
-        }
-    }
-
-    return result;
-}
 
 /**
  * @brief main entry point
@@ -251,7 +235,6 @@ int main( int argc, char * argv[] )
     struct fuse_args args = FUSE_ARGS_INIT( argc, argv );
 
     static const char defaultTmplDir[] = "/templates";
-
 
     globals.myName = strdup( basename(argv[0] ));
     openlog( globals.myName, LOG_PID, LOG_DAEMON);
@@ -271,70 +254,56 @@ int main( int argc, char * argv[] )
     }
 #endif
 
-    if ( fuse_version() < FUSE_USE_VERSION )
-    {
-        fprintf(stderr, "The FUSE API version (%d) is older than %s requires (%d).\nAborting...",
-                fuse_version(),
-                globals.myName,
-                FUSE_USE_VERSION);
-        exit (-1);
+    if ( fuse_version() < FUSE_USE_VERSION ) {
+        fuse_log( FUSE_LOG_CRIT, "error: libfuze is too old" );
+        fprintf( stderr,
+                 "The installed FUSE library (version %d) is older than %s requires (%d).\n"
+                 "Cannot continue...",
+                 fuse_version(),
+                 globals.myName,
+                 FUSE_USE_VERSION );
+        exit( -1 );
     }
 
     /* first, let libfuse parse the common options from the command line */
-    if ( fuse_parse_cmdline( &args, &globals.options.common ) == -1 )
-    {
+    if ( fuse_parse_cmdline( &args, &globals.options ) == -1 ) {
         fuse_log( FUSE_LOG_CRIT, "error: failed to parse command line" );
         result = 1;
-    }
-    else
-    {
-        memset( &globals.options.template, 0, sizeof( tTemplateOptions ));
-        /* now extract options that are specific to templatefs */
-        if ( fuse_opt_parse( &args, &globals.options.template, tmplCmdLineOptions, processTmplOpts ) == -1)
-        {
-            fuse_log( FUSE_LOG_CRIT, "error: failed to parse templatefs options");
-            result = 8;
+    } else if ( globals.options.show_version ) {
+        printf( "%s version %s\n"
+                "FUSE Library version %s is installed\n",
+                globals.myName,
+                VERSION,
+                fuse_pkgversion() );
+
+        result = 0;
+    } else if ( globals.options.show_help ) {
+        if ( args.argv[ 0 ][ 0 ] != '\0' ) {
+            printf( "usage: %s [options] <mountpoint>\n\n", globals.myName );
         }
-        else
-        {
-            if ( globals.options.common.show_version )
-            {
-                printf( "%s version %s\n", globals.myName, PACKAGE_VERSION );
+        printf( "FUSE options:\n" );
 
-                fuse_version();
+        /* ToDo: also output templatefs-specific options */
+        fuse_lib_help( &args );
 
-                result = 0;
-            }
-            else if ( globals.options.common.show_help )
-            {
-                if ( args.argv[0][0] != '\0' )
-                {
-                    printf( "usage: %s [options] <mountpoint>\n\n", globals.myName );
-                }
-                printf( "FUSE options:\n" );
-
-                /* ToDo: add templatefs-specific options here */
-
-                fuse_lib_help( &args );
-                result = 0;
-            }
-            else
-            {
-                if ( !globals.options.common.mountpoint )
-                {
-                    fuse_log( FUSE_LOG_CRIT, "error: no mountpoint specified" );
-                    result = 2;
-                }
-                else
-                {
-                    setupFSTree( &globals.mountpoint, globals.options.common.mountpoint );
-                    setupFSTree( &globals.templates,  globals.options.template.templates );
-
-                    result = lightFuse( &args );
-
-                    free( globals.mountpoint.path );
-                    free( globals.templates.path );
-                }
+        result = 0;
+    } else /* not --version or --help, so check for templatefs-specific options */
+    {
+        memset( &globals.template, 0, sizeof( tTemplateOptions ) );
+        /* extract options that are specific to templatefs */
+        if ( fuse_opt_parse( &args, &globals.template, tmplCmdLineOptions, processTmplOpts ) ==
+             -1 ) {
+            fuse_log( FUSE_LOG_CRIT, "error: failed to parse templatefs options" );
+            result = 8;
+        } else {
+            if ( globals.options.mountpoint == NULL ) {
+                fuse_log( FUSE_LOG_CRIT, "error: no mountpoint specified" );
+                result = 2;
+            } else if ( globals.template.templates == NULL ) {
+                fuse_log( FUSE_LOG_CRIT, "error: no template directory specified" );
+                result = 2;
+            } else {
+                result = lightFuse( &args );
             }
         }
     }
