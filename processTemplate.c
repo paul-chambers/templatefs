@@ -29,10 +29,65 @@
  * to avoid clashes.
  */
 
+typedef struct sSection {
+    struct sSection *   next;
+    int                 depth;
+    char *              name;
+    Key *               selection;
+} tSection;
+
 typedef struct {
-    KDB *    kdb;
-    KeySet * keySet;
+    KDB *       kdb;
+    KeySet *    keySet;
+
+    tSection *  stack;
+
 } tMustachContext;
+
+int sectionPush( tMustachContext * context, int objiter )
+{
+    int result = 0;
+
+    tSection * section = calloc( 1, sizeof(tSection));
+    if ( section == NULL ) {
+        result = -ENOMEM;
+    } else {
+        section->depth     = objiter;
+
+        /* if there is another level below this one in the stack,
+         * copy its contents up to populate the new one */
+        if ( context->stack != NULL ) {
+            section->name      = strdup( context->stack->name );
+            section->selection = keyDup( context->stack->selection, KEY_CP_ALL );
+        }
+
+        /* push the new section onto the 'stack' (linked list) */
+        section->next  = context->stack;
+        context->stack = section;
+    }
+
+    return result;
+}
+
+int sectionPop( tMustachContext * context )
+{
+    int result = 0;
+
+    if ( context->stack == NULL ) {
+        logError( "attempted to leave more times than we entered" );
+        result = MUSTACH_ERROR_TOO_DEEP;
+    } else {
+        tSection * section = context->stack;
+        /* 'pop' the stack by unlinking the top (first) item */
+        context->stack = section->next;
+        /* release resources associated with that section */
+        free( section->name );
+        keyDel( section->selection );
+        /* release the section itself */
+        free( section );
+    }
+    return result;
+}
 
 /**
  * @brief
@@ -50,6 +105,8 @@ int elektraStart( void * closure )
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
+        /* always at least ine entry on the stack */
+        result = sectionPush( context, -1 );
     }
 
 	return result;
@@ -70,6 +127,8 @@ void elektraStop( void * closure, int status )
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
+        /* dispose of the entry at the top of the stack */
+        sectionPop( context );
     }
 }
 
@@ -118,6 +177,10 @@ int elektraSel( void * closure, const char * name )
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
+        if ( context->stack->name != NULL ) {
+            free( context->stack->name );
+        }
+        context->stack->name = strdup( name );
     }
 
 	return result;
@@ -167,6 +230,8 @@ int elektraEnter( void * closure, int objiter )
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
+
+        sectionPush( context, objiter );
     }
 
 	return result;
@@ -194,6 +259,8 @@ int elektraNext( void * closure )
 	return result;
 }
 
+
+
 /**
  * @brief Leaves the last entered section
  * @param closure
@@ -207,6 +274,7 @@ int elektraLeave( void * closure )
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext *) closure;
+        result = sectionPop( context );
     }
 
     return result;
@@ -293,15 +361,15 @@ int initElektra( tMustachContext * context )
         Key  * parent  = keyNew( keyName, KEY_END );
 
         context->kdb = kdbOpen( NULL, parent );
-        fuse_log( FUSE_LOG_DEBUG, "kdb = %p for \'%s\'", context->kdb, keyName );
+        logDebug( "kdb = %p for \'%s\'", context->kdb, keyName );
 
         if ( context->kdb == NULL ) {
-            fuse_log( FUSE_LOG_ERR, "unable to open libelektra" );
+            logError( "unable to open libelektra" );
             result = -EFAULT;
         } else {
             context->keySet = ksNew( 0, KS_END );
             if ( context->keySet == NULL ) {
-                fuse_log( FUSE_LOG_ERR, "failed to create a KeySet" );
+                logError( "failed to create a KeySet" );
                 result = -EADDRNOTAVAIL;
             } else {
                 /* It's necessary to preload the keySet.
@@ -340,8 +408,7 @@ int processTemplate( int fd, byte ** buffer, size_t * size )
 {
     int result = -ENOMEM;
 
-    tMustachContext * context = calloc( 1,
-                                        sizeof( tMustachContext ));
+    tMustachContext * context = calloc( 1, sizeof( tMustachContext ));
     if ( context != NULL ) {
         struct stat st;
         result = fstat( fd, &st );

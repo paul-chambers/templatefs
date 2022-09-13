@@ -165,6 +165,7 @@ int getMountpointFD( void )
     {
         result = privateData->mountpoint.fd;
     }
+
     return result;
 }
 
@@ -177,6 +178,7 @@ int getTemplateFD( void )
     {
         result = privateData->templates.fd;
     }
+
     return result;
 }
 
@@ -268,28 +270,48 @@ int getFileAttrOp( const char * path, struct stat * stbuf, struct fuse_file_info
 
     tFHFile * fh = getFileHandle( fi );
 
-    /* ToDo: handle templates properly - particularly timestamps */
-    if ( fh != NULL ) {
-        result = fixupResult( fstat( fh->fd, stbuf ) );
+    bool isTemplate;
 
-        if ( fh->isTemplate ) {
-            /* if it's a template, report it as read-only/not executable */
-            mode_t mask = S_IWUSR | S_IWGRP | S_IWOTH;
-            if ( !S_ISDIR( stbuf->st_mode ) ) {
-                /* if it's not a directory, clear the exec bits too */
-                mask = mask | S_IXUSR | S_IXGRP | S_IXOTH;
-            }
-            stbuf->st_mode = stbuf->st_mode & ~mask;
-            /* return the length of the cached contents */
-            if ( fh->contents != NULL ) {
-                stbuf->st_size = fh->length;
-            }
+    /* ToDo: handle templates better - particularly timestamps */
+
+    if ( fh == NULL ) {
+        isTemplate = hasTemplate( path );
+    } else {
+        isTemplate = fh->isTemplate;
+    }
+
+    if ( fh == NULL ) {
+        int rootFD;
+
+        if ( isTemplate ) {
+            rootFD = getTemplateFD();
+        } else {
+            rootFD = getMountpointFD();
+        }
+
+        result = fixupResult( fstatat( rootFD,
+                                             &path[ 1 ],
+                                             stbuf,
+                                             AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW ) );
+    } else {
+        result = fixupResult( fstat( fh->fd, stbuf ) );
+    }
+
+    if ( isTemplate ) {
+
+        /* if it's a template, report it as read-only/not executable */
+        mode_t mask = S_IWUSR | S_IWGRP | S_IWOTH;
+        if ( !S_ISDIR( stbuf->st_mode ) ) {
+            /* if it's not a directory, clear the exec bits too */
+            mask = mask | S_IXUSR | S_IXGRP | S_IXOTH;
+        }
+        stbuf->st_mode = stbuf->st_mode & ~mask;
+
+        /* return the length of the cached contents */
+        if ( fh != NULL && fh->contents != NULL ) {
+            stbuf->st_size = fh->length;
         }
     } else {
-        result = fixupResult( fstatat( getMountpointFD(),
-                                        &path[ 1 ],
-                                        stbuf,
-                                        AT_EMPTY_PATH | AT_SYMLINK_NOFOLLOW ) );
     }
 
     return result;
