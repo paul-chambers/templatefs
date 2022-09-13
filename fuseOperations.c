@@ -4,6 +4,7 @@
 
 #include "common.h"
 #include "templatefs.h"
+#include "logStuff.h"
 
 #ifdef HAVE_SETXATTR
 #include <sys/xattr.h>
@@ -81,6 +82,7 @@ static inline int fixupResult( int result )
     {
         result = -errno;
     }
+    return result;
 }
 
 // ------------------------------------------------------------------------------
@@ -185,17 +187,13 @@ static inline int hasTemplate( const char * path )
 
 int setupFSTree( tFSTree * tree, const char * path )
 {
-    int result;
+    int result = 0;
 
     tree->path = realpath( path, NULL );
     if ( tree->path == NULL || access( tree->path, F_OK ) != 0 ) {
-        fuse_log( FUSE_LOG_CRIT,
-                  "error: path \"%s\" is invalid", tree->path );
+        logCritical( "fatal: path \'%s\' is invalid", tree->path );
         result = -errno;
     } else {
-        fuse_log( FUSE_LOG_INFO,
-                  "path is \"%s\"", tree->path );
-
         tree->fd  = -1;
         tree->dir = opendir( tree->path );
         if ( tree->dir != NULL ) {
@@ -211,7 +209,7 @@ int setupFSTree( tFSTree * tree, const char * path )
 
 void * initPrivateData( const char * mountPath, const char * templatePath )
 {
-    LOG_ON_ENTRY("(\'%s\',\'%s\')", mountPath, templatePath );
+    logEntry( "\'%s\',\'%s\'", mountPath, templatePath );
 
     tPrivateData * result = calloc( 1, sizeof( tPrivateData ) );
     if ( result != NULL ) {
@@ -233,7 +231,7 @@ void * initPrivateData( const char * mountPath, const char * templatePath )
  */
 void * initFsOp( struct fuse_conn_info * UNUSED( conn ), struct fuse_config * cfg )
 {
-    LOG_ON_ENTRY( "(%p,%p)", conn, cfg );
+    logEntry( "%p,%p", conn, cfg );
 
     cfg->use_ino     = 1;
     cfg->nullpath_ok = 1;
@@ -266,7 +264,7 @@ void * initFsOp( struct fuse_conn_info * UNUSED( conn ), struct fuse_config * cf
 int getFileAttrOp( const char * path, struct stat * stbuf, struct fuse_file_info * fi )
 {
     int result;
-    LOG_ON_ENTRY( "(\"%s\", %p, %p)", path, stbuf, fi );
+    logEntry( "\'%s\', %p, %p", path, stbuf, fi );
 
     tFHFile * fh = getFileHandle( fi );
 
@@ -308,7 +306,7 @@ int getFileAttrOp( const char * path, struct stat * stbuf, struct fuse_file_info
  */
 int fileAccessOp( const char * path, int mask )
 {
-    LOG_ON_ENTRY( "(\"%s\", %d)", path, mask );
+    logEntry( "\'%s\', %d", path, mask );
 
     return fixupResult( faccessat( getMountpointFD(),
                                          &path[ 1 ],
@@ -328,7 +326,7 @@ int readSymlinkOp( const char * path, char * buf, size_t size )
 {
     int result;
 
-    LOG_ON_ENTRY( "(\"%s\", %p, %d)", path, buf, size );
+    logEntry( "\'%s\', %p, %d", path, buf, size );
 
     result = fixupResult( readlinkat( getMountpointFD(),
                                       &path[ 1 ],
@@ -354,7 +352,7 @@ int openDirOp( const char * path, struct fuse_file_info * fi )
 {
     int fd;
 
-    LOG_ON_ENTRY( "(\"%s\",%p)", path, fi );
+    logEntry( "\'%s\',%p", path, fi );
 
     tFHDir * dh = (tFHDir *) malloc( sizeof( tFileHandle ) );
 
@@ -379,7 +377,7 @@ int openDirOp( const char * path, struct fuse_file_info * fi )
     } else {
         dh->dp = fdopendir( fd );
         if ( dh->dp == NULL ) {
-            fuse_log( FUSE_LOG_ERR, "failed to open directory \"%s\"", path );
+            fuse_log( FUSE_LOG_ERR, "failed to open directory \'%s\'", path );
             free( dh );
             return -errno;;
         }
@@ -417,10 +415,12 @@ int readDirOp( const char * UNUSED( path ),
                struct fuse_file_info * fi,
                enum fuse_readdir_flags flags )
 {
-    /* ToDo: merge a list of entries under the mount point and template directory
+    (void)flags;
+
+    /* ToDo: merge entries from the mount point and corresponding template directory
      * Otherwise a template file that does not have a corresponding file under the
      * mountpoint will never be visible */
-    LOG_ON_ENTRY( "(\"%s\",%p)", path, fi );
+    logEntry( "\'%s\',%p", path, fi );
 
     tFHDir * dh = getDirHandle( fi );
 
@@ -499,7 +499,7 @@ int readDirOp( const char * UNUSED( path ),
  */
 int releaseDirOp( const char * UNUSED( path ), struct fuse_file_info * fi )
 {
-    LOG_ON_ENTRY( "(\"%s\",%p)", path, fi );
+    logEntry( "\'%s\',%p", path, fi );
 
     tFHDir * dh = getDirHandle( fi );
     if ( dh != NULL && dh->dp != NULL ) {
@@ -525,7 +525,7 @@ int releaseDirOp( const char * UNUSED( path ), struct fuse_file_info * fi )
  */
 int mkNodOp( const char * path, mode_t mode, dev_t rdev )
 {
-    LOG_ON_ENTRY( "(\"%s\",%d,%d)", path, mode, rdev );
+    logEntry( "\'%s\',%d,%d", path, mode, rdev );
 
     if ( S_ISFIFO( mode ) ) {
         return fixupResult( mkfifoat( getMountpointFD(),
@@ -552,7 +552,7 @@ int mkNodOp( const char * path, mode_t mode, dev_t rdev )
  */
 int createDirOp( const char * path, mode_t mode )
 {
-    LOG_ON_ENTRY( "(\"%s\",%d)", path, mode );
+    logEntry( "\'%s\',%d", path, mode );
 
     return fixupResult( mkdirat( getMountpointFD(), &path[ 1 ], mode ) );
 }
@@ -565,7 +565,7 @@ int createDirOp( const char * path, mode_t mode )
  */
 int fileUnlinkOp( const char * path )
 {
-    LOG_ON_ENTRY( "(\"%s\")", path );
+    logEntry( "\'%s\'", path );
 
     return fixupResult( unlinkat( getMountpointFD(), &path[ 1 ], 0 ) );
 }
@@ -577,7 +577,7 @@ int fileUnlinkOp( const char * path )
  */
 int removeDirOp( const char * path )
 {
-    LOG_ON_ENTRY( "(\"%s\")", path );
+    logEntry( "\'%s\'", path );
 
     return fixupResult( unlinkat(getMountpointFD(),
                                  &path[ 1 ],
@@ -592,7 +592,7 @@ int removeDirOp( const char * path )
  */
 int createSymlinkOp( const char * from, const char * to )
 {
-    LOG_ON_ENTRY( "(\"%s\",\"%s\")", from, to );
+    logEntry( "\'%s\',\'%s\'", from, to );
 
     return fixupResult( symlinkat( from, getMountpointFD(), &to[ 1 ] ) );
 }
@@ -608,7 +608,7 @@ int createSymlinkOp( const char * from, const char * to )
  */
 int renameFsObjOp( const char * from, const char * to, unsigned int flags )
 {
-    LOG_ON_ENTRY( "(\"%s\",\"%s\",%u)", from, to, flags );
+    logEntry( "\'%s\',\'%s\',%u", from, to, flags );
     return fixupResult( renameat2( getMountpointFD(),
                                          &from[ 1 ],
                                          getMountpointFD(),
@@ -620,7 +620,7 @@ int renameFsObjOp( const char * from, const char * to, unsigned int flags )
 int linkFileOp( const char * from, const char * to )
 {
     /* ToDo: fixup from and to */
-    LOG_ON_ENTRY( "(\"%s\",\"%s\")", from, to );
+    logEntry( "\'%s\',\'%s\'", from, to );
 
     return fixupResult( linkat( getMountpointFD(),
                                       &from[ 1 ],
@@ -637,7 +637,7 @@ int linkFileOp( const char * from, const char * to )
  */
 int chmodFileOp( const char * path, mode_t mode, struct fuse_file_info * fi )
 {
-    LOG_ON_ENTRY( "(\"%s\",%p,%p)", path, mode, fi );
+    logEntry( "\'%s\',%p,%p", path, mode, fi );
 
     tFHFile * fh = getFileHandle( fi );
     if ( fh != NULL ) {
@@ -660,7 +660,7 @@ int chmodFileOp( const char * path, mode_t mode, struct fuse_file_info * fi )
  */
 int chownFileOp( const char * path, uid_t uid, gid_t gid, struct fuse_file_info * fi )
 {
-    LOG_ON_ENTRY( "(\"%s\",%u,%u,%p)", path, uid, gid, fi );
+    logEntry( "\'%s\',%u,%u,%p", path, uid, gid, fi );
 
     tFHFile * fh = getFileHandle( fi );
     if ( fh ) {
@@ -685,15 +685,15 @@ int chownFileOp( const char * path, uid_t uid, gid_t gid, struct fuse_file_info 
 int truncateFileOp( const char * path, off_t size, struct fuse_file_info * fi )
 {
     int result = 0;
-    LOG_ON_ENTRY( "(\"%s\",%u,%p)", path, size, fi );
+    logEntry( "\'%s\',%u,%p", path, size, fi );
 
     if ( fi == NULL ) {
-        fuse_log( FUSE_LOG_WARNING, "truncating \"%s\" with null fuse_file_info", path );
+        fuse_log( FUSE_LOG_WARNING, "truncating \'%s\' with null fuse_file_info", path );
         result = fixupResult( truncate( path, size ) );
     } else {
         tFHFile * fh = getFileHandle( fi );
         if ( fh == NULL ) {
-            fuse_log( FUSE_LOG_ERR, "attempt to truncate \"%s\" with invalid fileHandle",
+            fuse_log( FUSE_LOG_ERR, "attempt to truncate \'%s\' with invalid fileHandle",
                       path );
             result = -EINVAL;
         } else {
@@ -753,7 +753,7 @@ int utimensOp( const char *path,
  */
 int createFileOp( const char * path, mode_t mode, struct fuse_file_info * fi )
 {
-    LOG_ON_ENTRY( "(\"%s\",%u,%p)", path, mode, fi );
+    logEntry( "\'%s\',%u,%p", path, mode, fi );
 
     tFHFile * fh = (tFHFile *) calloc( 1, sizeof( tFileHandle ) );
 
@@ -819,7 +819,7 @@ int openFileOp( const char * path, struct fuse_file_info * fi )
     int result = 0;
     int fd;
 
-    LOG_ON_ENTRY( "(\'%s\', %p)", path, fi );
+    logEntry( "\'%s\', %p", path, fi );
 
     if ( fi == NULL ) {
         fuse_log( FUSE_LOG_ERR, "can't open a file using a null file_info structure" );
@@ -877,14 +877,14 @@ int readFileOp( const char * UNUSED( path ),
                 struct fuse_file_info * fi )
 {
     int result = 0;
-    LOG_ON_ENTRY( "(\'%s\', %p, %ul, %ul, %p)", path, buf, size, offset, fi );
+    logEntry( "\'%s\', %p, %ul, %ul, %p", path, buf, size, offset, fi );
 
     tFHFile * fh = getFileHandle( fi );
     if ( fh == NULL ) {
         result = -ENFILE;
     } else {
         if ( fh->isTemplate ) {
-            if (fh->contents == NULL || offset >= fh->length ) {
+            if (fh->contents == NULL || (size_t)offset >= fh->length ) {
                 result = -EOF;
             } else {
                 /* if trying to read more data than we have, trim the size */
@@ -924,7 +924,7 @@ int readFileBufOp( const char * UNUSED( path ),
 {
     int result = 0;;
     tFHFile * fh = NULL;
-    LOG_ON_ENTRY( "(\"%s\", %p)", path, fi );
+    logEntry( "\'%s\', %p", path, fi );
 
     if ( fi == NULL ) {
         result = -ENFILE;
@@ -966,7 +966,7 @@ int writeFileOp( const char * UNUSED( path ), const char * buf, size_t size,
 {
     int result;
 
-    LOG_ON_ENTRY( "(\"%s\",%p,%u,%u,%p)", path, buf, size, offset, fi );
+    logEntry( "\'%s\',%p,%u,%u,%p", path, buf, size, offset, fi );
 
     tFHFile * fh = getFileHandle( fi );
     if ( fh == NULL ) {
@@ -998,7 +998,7 @@ int writeFileBufOp( const char * UNUSED( path ), struct fuse_bufvec * buf, off_t
 {
     struct fuse_bufvec dst = FUSE_BUFVEC_INIT( fuse_buf_size( buf ) );
 
-    LOG_ON_ENTRY( "(\"%s\",%p,%u,%p)", path, buf, offset, fi );
+    logEntry( "\'%s\',%p,%u,%p", path, buf, offset, fi );
 
     tFHFile * fh = getFileHandle( fi );
     if ( fh == NULL ) {
@@ -1019,7 +1019,7 @@ int writeFileBufOp( const char * UNUSED( path ), struct fuse_bufvec * buf, off_t
  */
 int getFsStatsOp( const char * path, struct statvfs * stbuf )
 {
-    LOG_ON_ENTRY( "(\"%s\",%p)", path, stbuf );
+    logEntry( "\'%s\',%p", path, stbuf );
 
     return fixupResult( statvfs( path, stbuf ) );
 }
@@ -1054,7 +1054,7 @@ int getFsStatsOp( const char * path, struct statvfs * stbuf )
 int flushFileOp( const char * UNUSED( path ), struct fuse_file_info * fi )
 {
     int result = 0;
-    LOG_ON_ENTRY( "(\"%s\",%p)", path, fi );
+    logEntry( "\'%s\',%p", path, fi );
 
     tFHFile * fh = getFileHandle( fi );
     if ( fh == NULL ) {
@@ -1090,7 +1090,7 @@ int flushFileOp( const char * UNUSED( path ), struct fuse_file_info * fi )
  */
 int releaseFileOp( const char * UNUSED( path ), struct fuse_file_info * fi )
 {
-    LOG_ON_ENTRY( "(\"%s\",%p)", path, fi );
+    logEntry( "\'%s\',%p", path, fi );
     int result = -ENFILE;
 
     tFHFile * fh = getFileHandle( fi );
@@ -1121,7 +1121,7 @@ int fsyncFileOp( const char * UNUSED( path ),
 {
     int result = -ENFILE;
 
-    LOG_ON_ENTRY( "(\"%s\",%u,%p)", path, isdatasync, fi );
+    logEntry( "\'%s\',%u,%p", path, isdatasync, fi );
 
     tFHFile * fh = getFileHandle( fi );
     if ( fh != NULL ) {
@@ -1266,7 +1266,7 @@ int lockFileOp( const char *UNUSED( path), struct fuse_file_info *fi, int cmd, s
  */
 int flockFileOp( const char * UNUSED( path ), struct fuse_file_info * fi, int op )
 {
-    LOG_ON_ENTRY( "(\"%s\",%p,%u)", path, fi, op );
+    logEntry( "\'%s\',%p,%d", path, fi, op );
     int result = -ENFILE;
 
     tFHFile * fh = getFileHandle( fi );
@@ -1324,7 +1324,7 @@ off_t lseekFileOp( const char * UNUSED( path ),
                    int whence,
                    struct fuse_file_info * fi )
 {
-    LOG_ON_ENTRY( "(\"%s\",%u,%u,%p)", path, off, whence, fi );
+    logEntry( "\'%s\',%u,%d,%p", path, off, whence, fi );
     off_t result = -ENFILE;
 
     tFHFile * fh = getFileHandle( fi );
@@ -1361,9 +1361,9 @@ const struct fuse_operations templatefsOperations = {
     .create          = createFileOp,
     .open            = openFileOp,
     .read            = readFileOp,
-//    .read_buf        = readFileBufOp,
+//  .read_buf        = readFileBufOp,
     .write           = writeFileOp,
-//    .write_buf       = writeFileBufOp,
+//  .write_buf       = writeFileBufOp,
     .statfs          = getFsStatsOp,
     .flush           = flushFileOp,
     .release         = releaseFileOp,

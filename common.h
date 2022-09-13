@@ -21,11 +21,8 @@
 
 #define UNUSED(arg) __attribute__((unused)) arg
 
-#define LOG_ON_ENTRY( fmt, ... ) \
+/* #define LOG_ON_ENTRY( fmt, ... ) \
     fuse_log( FUSE_LOG_DEBUG, "%s" fmt, __func__, ##__VA_ARGS__ )
-
-#define LOG_RESULT( fmt, ... ) \
-    fuse_log( FUSE_LOG_DEBUG, "%s returned " fmt, __func__, ##__VA_ARGS__ )
-
+*/
 
 #endif //TEMPLATEFS_COMMON_H

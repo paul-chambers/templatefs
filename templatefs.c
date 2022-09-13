@@ -27,6 +27,7 @@
 
 #include "common.h"
 #include "templatefs.h"
+#include "logStuff.h"
 
 #ifdef HAVE_LIBULOCKMGR
 #include <ulockmgr.h>
@@ -74,6 +75,7 @@ const struct fuse_opt tmplCmdLineOptions[] =
 
 int processTmplOpts( void * data, const char * arg, int key, struct fuse_args * outargs )
 {
+    (void)data; (void)arg; (void)key; (void)outargs;
     return 1;
 }
 
@@ -131,50 +133,38 @@ void __cyg_profile_func_exit( void * func, void * caller )
 
 // ------------------------------------------------------------------------------
 
-#if 0
-#define dumpArgs( args ) dumpArgs2( __LINE__, args )
-void dumpArgs2( unsigned int lineNum, struct fuse_args * args )
-{
-    fuse_log( FUSE_LOG_DEBUG, "At line %d. allocated: %d", lineNum, args->allocated );
-    fuse_log( FUSE_LOG_DEBUG, "argc: %d", args->argc );
-    for ( int i = 0; i < args->argc; ++i )
-    {
-        fuse_log( FUSE_LOG_DEBUG, "%d: \"%s\"", i, args->argv[i] );
-    }
-}
-#endif
-
 int lightFuse( struct fuse_args * args )
 {
     int result;
     struct fuse * fuse;
 
-    fuse_log( FUSE_LOG_DEBUG, "fuse_new(%p,%p,%u,%p)",
+    logDebug( "%p,%p,%lu,%p",
               args,
               &templatefsOperations,
               sizeof( templatefsOperations ),
               NULL);
 
     fuse = fuse_new( args,
-                     &templatefsOperations, sizeof( templatefsOperations ),
+                     &templatefsOperations,
+                     sizeof( templatefsOperations ),
                      initPrivateData( globals.options.mountpoint,
                                       globals.template.templates ) );
 
     if ( fuse == NULL)
     {
-        fuse_log( FUSE_LOG_CRIT, "error: fuse_new failed" );
+        logCritical( "error: fuse_new failed" );
         result = 3;
     }
     else if ( fuse_mount( fuse, globals.options.mountpoint ) != 0 )
     {
-        fuse_log( FUSE_LOG_CRIT, "error: fuse_mount failed" );
+        logCritical( "error: fuse_mount failed" );
         result = 4;
     }
     else
     {
         if ( fuse_daemonize( globals.options.foreground ) != 0 )
         {
-            fuse_log( FUSE_LOG_CRIT, "error: fuse_daemonize failed" );
+            logCritical( "error: fuse_daemonize failed" );
             result = 5;
         }
         else
@@ -183,7 +173,7 @@ int lightFuse( struct fuse_args * args )
 
             if ( fuse_set_signal_handlers( se ) != 0 )
             {
-                fuse_log( FUSE_LOG_CRIT, "error: fuse_set_signal_handlers failed" );
+                logCritical( "error: fuse_set_signal_handlers failed" );
                 result = 6;
             }
             else
@@ -202,7 +192,7 @@ int lightFuse( struct fuse_args * args )
                 }
                 if ( result != 0 )
                 {
-                    fuse_log( FUSE_LOG_CRIT, "error: fuse_loop failed" );
+                    logCritical( "error: fuse_loop failed" );
                     result = 7;
                 }
                 fuse_remove_signal_handlers( se );
@@ -214,13 +204,6 @@ int lightFuse( struct fuse_args * args )
 
     return result;
 }
-
-__attribute__((no_instrument_function))
-void log_to_syslog( enum fuse_log_level level, const char * fmt, va_list ap )
-{
-    vsyslog( level, fmt, ap );
-}
-
 
 /**
  * @brief main entry point
@@ -234,28 +217,26 @@ int main( int argc, char * argv[] )
     int              result;
     struct fuse_args args = FUSE_ARGS_INIT( argc, argv );
 
-    static const char defaultTmplDir[] = "/templates";
-
     globals.myName = strdup( basename(argv[0] ));
-    openlog( globals.myName, LOG_PID, LOG_DAEMON);
-    fuse_set_log_func( log_to_syslog );
+    initLogStuff( globals.myName );
+    setLogStuffDestination( kLogDebug, kLogToSyslog, kLogNormal );
 
-    fuse_log( FUSE_LOG_INFO, "%s started", globals.myName );
+    logInfo( "%s started", globals.myName );
 
 #ifdef INSTRUMENT_FUNCTIONS
     symbols = dlopen(NULL, RTLD_NOW );
     if ( symbols == NULL)
     {
-        fuse_log( FUSE_LOG_ERR, "unable to load symbols (%s)", dlerror());
+        logError( "unable to load symbols (%s)", dlerror() );
     }
     else
     {
-        fuse_log( FUSE_LOG_DEBUG, "symbols loaded at %p", symbols );
+        logDebug( "symbols loaded at %p", symbols );
     }
 #endif
 
     if ( fuse_version() < FUSE_USE_VERSION ) {
-        fuse_log( FUSE_LOG_CRIT, "error: libfuze is too old" );
+        logCritical( "fatal: libfuse is too old" );
         fprintf( stderr,
                  "The installed FUSE library (version %d) is older than %s requires (%d).\n"
                  "Cannot continue...",
@@ -267,7 +248,7 @@ int main( int argc, char * argv[] )
 
     /* first, let libfuse parse the common options from the command line */
     if ( fuse_parse_cmdline( &args, &globals.options ) == -1 ) {
-        fuse_log( FUSE_LOG_CRIT, "error: failed to parse command line" );
+        logCritical( "fatal: failed to parse command line" );
         result = 1;
     } else if ( globals.options.show_version ) {
         printf( "%s version %s\n"
@@ -291,16 +272,18 @@ int main( int argc, char * argv[] )
     {
         memset( &globals.template, 0, sizeof( tTemplateOptions ) );
         /* extract options that are specific to templatefs */
-        if ( fuse_opt_parse( &args, &globals.template, tmplCmdLineOptions, processTmplOpts ) ==
-             -1 ) {
-            fuse_log( FUSE_LOG_CRIT, "error: failed to parse templatefs options" );
+        if ( fuse_opt_parse( &args,
+                             &globals.template,
+                             tmplCmdLineOptions,
+                             processTmplOpts ) == -1 ) {
+            logCritical( "fatal: failed to parse templatefs options" );
             result = 8;
         } else {
             if ( globals.options.mountpoint == NULL ) {
-                fuse_log( FUSE_LOG_CRIT, "error: no mountpoint specified" );
+                logCritical( "fatal: no mountpoint specified" );
                 result = 2;
             } else if ( globals.template.templates == NULL ) {
-                fuse_log( FUSE_LOG_CRIT, "error: no template directory specified" );
+                logCritical( "fatal: no template directory specified" );
                 result = 2;
             } else {
                 result = lightFuse( &args );

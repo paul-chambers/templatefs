@@ -5,6 +5,7 @@
 #include "common.h"
 #include "templatefs.h"
 #include "processTemplate.h"
+#include "logStuff.h"
 
 #include <sys/mman.h>
 
@@ -29,7 +30,8 @@
  */
 
 typedef struct {
-    int placeholder;
+    KDB *    kdb;
+    KeySet * keySet;
 } tMustachContext;
 
 /**
@@ -42,12 +44,12 @@ typedef struct {
  */
 int elektraStart( void * closure )
 {
-    LOG_ON_ENTRY( "()" );
+    logEntry( "" );
+
     int result = MUSTACH_OK;
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
-        context->placeholder = 0;
     }
 
 	return result;
@@ -64,11 +66,10 @@ int elektraStart( void * closure )
  */
 void elektraStop( void * closure, int status )
 {
-    LOG_ON_ENTRY( "(%d)", status );
+    logEntry( "%d", status );
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
-        context->placeholder = 0;
     }
 }
 
@@ -88,12 +89,12 @@ void elektraStop( void * closure, int status )
  */
 int elektraCompare( void * closure, const char * value )
 {
-    LOG_ON_ENTRY( "(\'%s\')", value );
-    int result = MUSTACH_OK;
+    logEntry( "\'%s\'", value );
+
+    int result = 0;
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
-        context->placeholder = 0;
     }
 
 	return result;
@@ -111,12 +112,12 @@ int elektraCompare( void * closure, const char * value )
  */
 int elektraSel( void * closure, const char * name )
 {
-    LOG_ON_ENTRY( "(\'%s\')", name );
-    int result = 0;
+    logEntry( "\'%s\'", name );
+
+    int result = 1;
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
-        context->placeholder = 0;
     }
 
 	return result;
@@ -133,12 +134,12 @@ int elektraSel( void * closure, const char * name )
  */
 int elektraSubsel( void * closure, const char * name )
 {
-    LOG_ON_ENTRY( "(\'%s\')", name );
+    logEntry( "\'%s\'", name );
+
     int result = 0;
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
-        context->placeholder = 0;
     }
 
 	return result;
@@ -160,15 +161,12 @@ int elektraSubsel( void * closure, const char * name )
  */
 int elektraEnter( void * closure, int objiter )
 {
-    LOG_ON_ENTRY( "(\'%d\')", objiter );
+    logEntry( "%d", objiter );
 
-    int result = 0;
-
-    fuse_log( FUSE_LOG_DEBUG, "enter: %d", objiter );
+    int result = 1;
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
-        context->placeholder = 0;
     }
 
 	return result;
@@ -185,14 +183,12 @@ int elektraEnter( void * closure, int objiter )
  */
 int elektraNext( void * closure )
 {
-    LOG_ON_ENTRY( "()" );
-    int result = 0;
+    logEntry( "" );
 
-    fuse_log( FUSE_LOG_DEBUG, "next" );
+    int result = 0;
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext * )closure;
-        context->placeholder = 0;
     }
 
 	return result;
@@ -205,14 +201,12 @@ int elektraNext( void * closure )
  */
 int elektraLeave( void * closure )
 {
-    LOG_ON_ENTRY( "()" );
-    int result = MUSTACH_OK;
+    logEntry( "" );
 
-    fuse_log( FUSE_LOG_DEBUG, "leave" );
+    int result = MUSTACH_OK;
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext *) closure;
-        context->placeholder = 0;
     }
 
     return result;
@@ -221,11 +215,11 @@ int elektraLeave( void * closure )
 /**
  * @brief return the value of key in sbuf
  *
- * Returns in 'sbuf' the value of the current selection if 'key'
- * is zero. Otherwise, when 'key' is not zero, return in 'sbuf'
- * the name of key of the current selection, or if no such key
- * exists, the empty string. Must return 1 if possible or
- * 0 when not possible or an error code.
+ *  Returns in 'sbuf' the value of the current selection if 'key' is zero. Otherwise,
+ *  when 'key' is not zero, return in 'sbuf' the name of key of the current selection,
+ *  or if no such key exists, the empty string. Must return 1 if possible or 0 when
+ *  not possible, or a negative error code.
+ *
  * @param closure
  * @param sbuf
  * @param key
@@ -233,12 +227,29 @@ int elektraLeave( void * closure )
  */
 int elektraGet( void * closure, struct mustach_sbuf * sbuf, int key )
 {
-    LOG_ON_ENTRY( "(%d)", key );
-    int result = MUSTACH_OK;
+    logEntry( "%d", key );
+
+    int result = 0;
 
     if ( closure != NULL ) {
         tMustachContext * context = (tMustachContext *) closure;
-        context->placeholder = 0;
+        switch ( key )
+        {
+        case 0: /* return the value */
+            result = 1;
+            break;
+
+        case 1: /* return key name */
+            result = 1;
+            break;
+
+        default:
+            logError( "invalid key value %d passed to get()", key );
+            sbuf->value  = NULL;
+            sbuf->length = 0;
+            result = 0;
+            break;
+        }
     }
 
 	return result;
@@ -255,6 +266,58 @@ struct mustach_wrap_itf elektraMustachItf = {
     .leave   = elektraLeave,
     .get     = elektraGet
 };
+
+void cleanupElektra( tMustachContext * context )
+{
+    if (context != NULL ){
+        if ( context->keySet != NULL ) {
+            ksDel( context->keySet );
+        }
+        if ( context->kdb != NULL ) {
+            kdbClose( context->kdb, NULL );
+        }
+    }
+}
+
+/**
+ * @brief prep libelektra for retrieval
+ * @param context
+ * @return zero if everything worked, negative if an error occurred
+ */
+int initElektra( tMustachContext * context )
+{
+    int result = -EINVAL;
+
+    if ( context != NULL ) {
+        char * keyName = strdup( "system:/config" );
+        Key  * parent  = keyNew( keyName, KEY_END );
+
+        context->kdb = kdbOpen( NULL, parent );
+        fuse_log( FUSE_LOG_DEBUG, "kdb = %p for \'%s\'", context->kdb, keyName );
+
+        if ( context->kdb == NULL ) {
+            fuse_log( FUSE_LOG_ERR, "unable to open libelektra" );
+            result = -EFAULT;
+        } else {
+            context->keySet = ksNew( 0, KS_END );
+            if ( context->keySet == NULL ) {
+                fuse_log( FUSE_LOG_ERR, "failed to create a KeySet" );
+                result = -EADDRNOTAVAIL;
+            } else {
+                /* It's necessary to preload the keySet.
+                 * No idea why, but errors occur if you don't. */
+                kdbGet( context->kdb, context->keySet, parent );
+                result = 0;
+            }
+        }
+
+        if ( result < 0 ) {
+            cleanupElektra( context );
+        }
+    }
+    return result;
+}
+
 
 /**
  * @brief process the template file
@@ -275,32 +338,42 @@ struct mustach_wrap_itf elektraMustachItf = {
 
 int processTemplate( int fd, byte ** buffer, size_t * size )
 {
-    struct stat st;
+    int result = -ENOMEM;
+
     tMustachContext * context = calloc( 1,
                                         sizeof( tMustachContext ));
-    int result = fstat( fd, &st );
-    if (result == -1) {
-        result = -errno;
-    } else {
-        /* memory-efficient way to feed the contents of the template file into mustach */
-        void * template = mmap( NULL,
-                                st.st_size,
-                                PROT_READ,
-                                MAP_PRIVATE,
-                                fd,
-                                0 );
+    if ( context != NULL ) {
+        struct stat st;
+        result = fstat( fd, &st );
+        if ( result == -1 ) {
+            result = -errno;
+        } else {
+            /* efficient way to feed the template file into mustach */
+            void * template = mmap( NULL,
+                                    st.st_size,
+                                    PROT_READ,
+                                    MAP_PRIVATE,
+                                    fd,
+                                    0 );
 
-        /* now parse the template to generate the content to cache */
-        result = mustach_wrap_mem( template,
-                                   st.st_size,
-                                   &elektraMustachItf,
-                                   (void *)context,
-                                   Mustach_With_AllExtensions,
-                                   (char **)buffer,
-                                   size);
+            if ( template != NULL ) {
+                if ( initElektra( context ) == 0 ) {
 
-        munmap( template, st.st_size );
+                    /* now parse the template to generate the content to cache */
+                    result = mustach_wrap_mem( template,
+                                               st.st_size,
+                                               &elektraMustachItf,
+                                               (void *) context,
+                                               Mustach_With_AllExtensions,
+                                               (char **) buffer,
+                                               size );
+
+                    cleanupElektra( context );
+                }
+                munmap( template, st.st_size );
+            }
+        }
+        free( context );
     }
-
     return result;
 }

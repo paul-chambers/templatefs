@@ -3,6 +3,9 @@ project(templatefs C)
 
 set(CMAKE_C_STANDARD 11)
 
+set(CMAKE_C_FLAGS "-Wall -Wextra")
+set(CMAKE_C_FLAGS_DEBUG "-g -DDEBUG=1")
+
 include_directories(.)
 
 find_library(DLFCN dl)
@@ -20,10 +23,11 @@ else (ELEKTRA_FOUND)
     message (FATAL_ERROR "Elektra not found")
 endif (ELEKTRA_FOUND)
 
-add_executable(templatefs
-        templatefs.c templatefs.h
-        fuseOperations.c fuseOperations.h
-        processTemplate.c processTemplate.h common.h)
+add_executable( templatefs common.h
+                templatefs.c templatefs.h
+                fuseOperations.c fuseOperations.h
+                processTemplate.c processTemplate.h
+                logStuff.c logStuff.h )
 
 target_link_libraries(templatefs ${DLFCN} ${FUSE3} ${PTHREAD} ${LUA} ${MUSTACH} ${ELEKTRA_LIBRARIES})
 
