@@ -19,10 +19,8 @@
 #include <sys/stat.h>
 #include <syslog.h>
 
-#define UNUSED(arg) __attribute__((unused)) arg
+#define UNUSED( arg ) __attribute__((unused)) arg
 
-/* #define LOG_ON_ENTRY( fmt, ... ) \
-    fuse_log( FUSE_LOG_DEBUG, "%s" fmt, __func__, ##__VA_ARGS__ )
-*/
+typedef char byte;
 
 #endif //TEMPLATEFS_COMMON_H

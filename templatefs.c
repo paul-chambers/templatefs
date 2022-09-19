@@ -50,27 +50,15 @@
 
 #define VERSION "0.2"
 
-typedef struct
-{
-    char * templates;
-} tTemplateOptions;
 
-struct
-{
-    const char * myName;        // the name used to start this executable
-
-    struct fuse_cmdline_opts options;
-    tTemplateOptions template;
-} globals;
+tGlobals globals;
 
 // ------------------------------------------------------------------------------
 
-#define MOUNT_OPT( t, p, v ) { t, offsetof(tTemplateOptions, p), v }
-
 const struct fuse_opt tmplCmdLineOptions[] =
 {
-        MOUNT_OPT( "templates=%s", templates,    0 ),
-        FUSE_OPT_END
+    { "templates=%s", offsetof( tTemplateOptions, templates ), 0 },
+    FUSE_OPT_END
 };
 
 int processTmplOpts( void * data, const char * arg, int key, struct fuse_args * outargs )
@@ -212,16 +200,23 @@ int lightFuse( struct fuse_args * args )
  * @return exit code
  */
 __attribute__((no_instrument_function))
-int main( int argc, char * argv[] )
+int main( int argc, char * argv[], char * const envp[] )
 {
-    int              result;
+    int              result = 0;
     struct fuse_args args = FUSE_ARGS_INIT( argc, argv );
 
-    globals.myName = strdup( basename(argv[0] ));
+    globals.myName = strdup( basename( argv[0] ) );
     initLogStuff( globals.myName );
     setLogStuffDestination( kLogDebug, kLogToSyslog, kLogNormal );
 
     logInfo( "%s started", globals.myName );
+
+    globals.envp = envp;
+
+    for ( int i = 0; envp[i] != NULL; ++i )
+    {
+        logDebug( "%d: %s", i, envp[i] );
+    }
 
 #ifdef INSTRUMENT_FUNCTIONS
     symbols = dlopen(NULL, RTLD_NOW );
@@ -250,38 +245,38 @@ int main( int argc, char * argv[] )
     if ( fuse_parse_cmdline( &args, &globals.options ) == -1 ) {
         logCritical( "fatal: failed to parse command line" );
         result = 1;
-    } else if ( globals.options.show_version ) {
-        printf( "%s version %s\n"
-                "FUSE Library version %s is installed\n",
-                globals.myName,
-                VERSION,
-                fuse_pkgversion() );
+    } else {
+        if ( globals.options.show_version ) {
+            printf( "%s version %s\n"
+                    "FUSE Library version %s is installed\n",
+                    globals.myName,
+                    VERSION,
+                    fuse_pkgversion() );
 
-        result = 0;
-    } else if ( globals.options.show_help ) {
-        if ( args.argv[ 0 ][ 0 ] != '\0' ) {
-            printf( "usage: %s [options] <mountpoint>\n\n", globals.myName );
-        }
-        printf( "FUSE options:\n" );
+            result = 0;
+        } else if ( globals.options.show_help ) {
+            if ( args.argv[ 0 ][ 0 ] != '\0' ) {
+                printf( "usage: %s [options] <mountpoint>\n\n", globals.myName );
+            }
+            printf( "FUSE options:\n" );
 
-        /* ToDo: also output templatefs-specific options */
-        fuse_lib_help( &args );
+            /* ToDo: also output templatefs-specific options */
+            fuse_lib_help( &args );
 
-        result = 0;
-    } else /* not --version or --help, so check for templatefs-specific options */
-    {
-        memset( &globals.template, 0, sizeof( tTemplateOptions ) );
-        /* extract options that are specific to templatefs */
-        if ( fuse_opt_parse( &args,
-                             &globals.template,
-                             tmplCmdLineOptions,
-                             processTmplOpts ) == -1 ) {
-            logCritical( "fatal: failed to parse templatefs options" );
-            result = 8;
+            result = 0;
+        } else if ( globals.options.mountpoint == NULL ) {
+            logCritical( "fatal: no mountpoint specified" );
+            result = 2;
         } else {
-            if ( globals.options.mountpoint == NULL ) {
-                logCritical( "fatal: no mountpoint specified" );
-                result = 2;
+            /* not --version or --help, so check for templatefs-specific options */
+            memset( &globals.template, 0, sizeof( tTemplateOptions ) );
+
+            if ( fuse_opt_parse( &args,
+                                 &globals.template,
+                                 tmplCmdLineOptions,
+                                 processTmplOpts ) == -1 ) {
+                logCritical( "fatal: failed to parse templatefs options" );
+                result = 8;
             } else if ( globals.template.templates == NULL ) {
                 logCritical( "fatal: no template directory specified" );
                 result = 2;
@@ -289,8 +284,8 @@ int main( int argc, char * argv[] )
                 result = lightFuse( &args );
             }
         }
+        fuse_opt_free_args( &args );
     }
-    fuse_opt_free_args( &args );
 
     return result;
 }

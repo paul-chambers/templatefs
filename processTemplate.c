@@ -13,6 +13,7 @@
 #include <elektra.h>
 #include <lua5.4/lua.h>
 #include <lua5.4/lualib.h>
+#include <sys/wait.h>
 
 /**
  * high level wrapper for mustach - interface for callbacks
@@ -153,7 +154,7 @@ int elektraCompare( void * closure, const char * value )
     int result = 0;
 
     if ( closure != NULL ) {
-        tMustachContext * context = (tMustachContext * )closure;
+//      tMustachContext * context = (tMustachContext * )closure;
     }
 
 	return result;
@@ -202,7 +203,7 @@ int elektraSubsel( void * closure, const char * name )
     int result = 0;
 
     if ( closure != NULL ) {
-        tMustachContext * context = (tMustachContext * )closure;
+//      tMustachContext * context = (tMustachContext * )closure;
     }
 
 	return result;
@@ -253,7 +254,7 @@ int elektraNext( void * closure )
     int result = 0;
 
     if ( closure != NULL ) {
-        tMustachContext * context = (tMustachContext * )closure;
+//      tMustachContext * context = (tMustachContext * )closure;
     }
 
 	return result;
@@ -300,7 +301,7 @@ int elektraGet( void * closure, struct mustach_sbuf * sbuf, int key )
     int result = 0;
 
     if ( closure != NULL ) {
-        tMustachContext * context = (tMustachContext *) closure;
+//      tMustachContext * context = (tMustachContext *) closure;
         switch ( key )
         {
         case 0: /* return the value */
@@ -386,11 +387,10 @@ int initElektra( tMustachContext * context )
     return result;
 }
 
-
 /**
  * @brief process the template file
  *
- * uses mustach_wrap_mem, which renders the mustache template into a memory buffer
+ * uses mustach_wrap_mem, which renders the mustache template into a memory data
  * using an abstract wrapper of interface 'itf' and 'closure'.
  *
  * @template: the template string to instanciate

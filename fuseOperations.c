@@ -14,6 +14,8 @@
 
 #include <fuse3/fuse.h>
 #include <stdbool.h>
+#include <sys/epoll.h>
+#include <sys/wait.h>
 
 #include "fuseOperations.h"
 #include "processTemplate.h"
@@ -21,7 +23,7 @@
 typedef struct {
     char * path;
     DIR  * dir;
-    int fd;
+    int    fd;
 } tFSTree;
 
 typedef struct {
@@ -30,10 +32,15 @@ typedef struct {
 } tPrivateData;
 
 typedef struct {
-    /* if isTemplate == false, transparently pass through the file 'underneath'.
-     * if isTemplate == true, then use the 'contents' buffer, which is the result of parsing the template */
-    bool   isTemplate;
+    const char * path;
+    /* -1 if fd not valid */
     int    fd;
+    /* if isTemplate == false, transparently pass through the file 'underneath'.
+     * if isTemplate == true, then use the 'contents' data, which is the result of parsing the template */
+    bool   isTemplate;
+    /* true if it's an _executable_ template file */
+    bool   isExecutable;
+
     size_t length;
     byte * contents;
 } tFHFile;
@@ -59,7 +66,58 @@ typedef struct {
 
 } tFileHandle;
 
+typedef struct {
+    char * data;
+    ssize_t available;
+    ssize_t remaining;
+    ssize_t headroom;
+} tElasticBuffer;
+
 // ------------------------------------------------------------------------------
+
+tElasticBuffer * newElasticBuffer( size_t size, size_t headroom )
+{
+    tElasticBuffer * result = calloc(1, sizeof(tElasticBuffer));
+    if ( result != NULL ) {
+        result->data      = calloc( 1, size);
+        result->available = 0;
+        result->remaining = size;
+        result->headroom = headroom;
+    }
+    return result;
+}
+
+void releaseElasticBuffer( tElasticBuffer * buf )
+{
+    free( buf->data );
+    free( buf );
+}
+
+/* Caution: calling realloc can move the data buffer. Be sure to call this
+ * function *before* you fetch buf->data */
+size_t makeRoom( tElasticBuffer * buf )
+{
+    if ( buf->remaining < buf->headroom ) {
+        buf->remaining += buf->headroom * 2;
+        buf->data = realloc( buf->data, buf->available + buf->remaining );
+    }
+    return buf->remaining;
+}
+
+char * getSpacePtr( tElasticBuffer * buf )
+{
+    /* Caution: if makeRoom causes a realloc, make sure it
+     * happens *before* doing any pointer arithmetic */
+    makeRoom( buf );
+    return buf->data + buf->available;
+}
+
+void increaseAvailable( tElasticBuffer * buf, size_t additional )
+{
+    buf->available += additional;
+    buf->remaining -= additional;
+    makeRoom(buf);
+}
 
 /**
  * @brief substitute -errno if result == -1
@@ -182,9 +240,14 @@ int getTemplateFD( void )
     return result;
 }
 
-static inline int hasTemplate( const char * path )
+static inline bool hasTemplate( const char * path )
 {
     return ( faccessat( getTemplateFD(), &path[1], R_OK, AT_SYMLINK_NOFOLLOW ) == 0 );
+}
+
+static inline bool isExecutable( const char * path )
+{
+    return ( faccessat( getTemplateFD(), &path[1], X_OK, AT_SYMLINK_NOFOLLOW ) == 0 );
 }
 
 int setupFSTree( tFSTree * tree, const char * path )
@@ -208,6 +271,7 @@ int setupFSTree( tFSTree * tree, const char * path )
 
     return result;
 }
+
 
 void * initPrivateData( const char * mountPath, const char * templatePath )
 {
@@ -311,7 +375,6 @@ int getFileAttrOp( const char * path, struct stat * stbuf, struct fuse_file_info
         if ( fh != NULL && fh->contents != NULL ) {
             stbuf->st_size = fh->length;
         }
-    } else {
     }
 
     return result;
@@ -338,10 +401,10 @@ int fileAccessOp( const char * path, int mask )
 
 /** Read the target of a symbolic link
  *
- * The buffer should be filled with a null terminated string.  The
- * buffer size argument includes the space for the terminating
+ * The data should be filled with a null terminated string.  The
+ * data size argument includes the space for the terminating
  * null character.	If the linkname is too long to fit in the
- * buffer, it should be truncated.	The return value should be 0
+ * data, it should be truncated.	The return value should be 0
  * for success.
  */
 int readSymlinkOp( const char * path, char * buf, size_t size )
@@ -419,7 +482,7 @@ int openDirOp( const char * path, struct fuse_file_info * fi )
  * A FUSEs filesystem may choose between two implementations for readdir.
  * This implementation keeps track of the offsets of the directory
  * entries.  It uses the offset parameter and always  passes non-zero
- * offset to the filler function.  When the buffer is full (or an error
+ * offset to the filler function.  When the data is full (or an error
  * happens) the filler function will return '1'.
  *
  * @param path
@@ -788,10 +851,154 @@ int createFileOp( const char * path, mode_t mode, struct fuse_file_info * fi )
                                   fi->flags,
                                   mode ) );
     if ( fd >= 0 ) {
+        fh->path = strdup( path );
         fh->fd = fd;
     }
     setFileHandle( fi, fh );
     return 0;
+}
+
+/**
+ * @brief
+ * @param fd
+ * @param buffer
+ * @param size
+ * @return
+ */
+int executeTemplate( tFHFile *fh, byte ** buffer, size_t * size )
+{
+    int result = 0;
+    tPrivateData * privateData;
+    char * argv[3];
+
+    int       stdoutPipe[2];
+    int       stderrPipe[2];
+    const int kPipeReadIdx  = 0;
+    const int kPipeWriteIdx = 1;
+
+    if ( pipe( stdoutPipe ) == -1 ) {
+        logError("unable to create pipe for stdout");
+        result = -errno;
+    } else if ( pipe( stderrPipe ) == -1 ) {
+        logError("unable to create pipe for stderr");
+        result = -errno;
+    } else {
+        privateData = getPrivateData();
+
+        pid_t pid = fork();
+        switch (pid)
+        {
+        case -1: /* the fork() failed */
+            logError( "failed to execute template");
+            result = -errno;
+            break;
+
+        case 0: /* we are the child */
+            if ( privateData != NULL ) {
+                /* set up the argv array */
+                asprintf( &argv[ 0 ], "%s%s", privateData->templates.path, fh->path );
+                asprintf( &argv[ 1 ], "%s%s", privateData->mountpoint.path, fh->path );
+                argv[ 2 ] = NULL;
+
+                dup2( stdoutPipe[ kPipeWriteIdx ], STDOUT_FILENO);
+                close( stdoutPipe[ kPipeReadIdx ] );
+                fprintf( stdout, "child wrote to stdout\n" );
+
+                dup2( stderrPipe[ kPipeWriteIdx ], STDERR_FILENO);
+                close( stderrPipe[ kPipeReadIdx ] );
+                fprintf( stderr, "child wrote to stderr\n" );
+
+                logDebug( "child: execve( %s, %s )", argv[ 0 ], argv[ 1 ] );
+                execve( argv[ 0 ], argv, globals.envp );
+                /* !!! not expected to return !!! */
+                result = -EXIT_FAILURE;
+            }
+            break;
+
+        default:
+            close( stdoutPipe[ kPipeWriteIdx ] );
+            close( stderrPipe[ kPipeWriteIdx ] );
+
+            static struct epoll_event events[2];
+            int epfd = epoll_create(4);
+
+            events[0].events  = EPOLLIN;
+            events[0].data.fd = stdoutPipe[ kPipeReadIdx ];
+            epoll_ctl( epfd, EPOLL_CTL_ADD, events[0].data.fd, &events[0] );
+
+            events[1].events  = EPOLLIN;
+            events[1].data.fd = stderrPipe[ kPipeReadIdx ];
+            epoll_ctl( epfd, EPOLL_CTL_ADD, events[1].data.fd, &events[1] );
+
+            tElasticBuffer * stdoutBuf = newElasticBuffer( 16384, 2048 );
+            tElasticBuffer * stderrBuf = newElasticBuffer( 16384, 2048 );
+            /* event loop to drain the pipes. Also watches for
+             * EPOLLHUP, which implies the child exited */
+            bool streamEOF = false;
+            do {
+                int eventCount = epoll_wait( epfd, events, 2, 10000 );
+
+                for ( int i = 0; i < eventCount; i++ ) {
+                    int eventFD = events[ i ].data.fd;
+                    if ( events[ i ].events & EPOLLIN ) {
+                        if ( eventFD == stdoutPipe[ kPipeReadIdx ] ) {
+                            size_t readSize = read( eventFD,
+                                                    getSpacePtr( stdoutBuf ),
+                                                    makeRoom( stdoutBuf ) );
+                            increaseAvailable( stdoutBuf, readSize );
+                        } else if ( eventFD == stderrPipe[ kPipeReadIdx ] ) {
+                            size_t readSize = read( eventFD,
+                                                    getSpacePtr( stderrBuf ),
+                                                    makeRoom( stderrBuf ) );
+                            increaseAvailable( stderrBuf, readSize );
+                        } else {
+                            logError( "epoll indicated data available on"
+                                      " unrecognized file descriptor %d", eventFD );
+                            /* ToDo: throw away the data, or we'll continue to get the same event */
+                        }
+                    }
+                    if ( events[ i ].events & ( EPOLLHUP | EPOLLERR ) ) {
+                        /* either no more data (child probably exited) or an error
+                         * either way, exit from the epoll loop */
+                        streamEOF = true;
+                    }
+                }
+            } while ( !streamEOF );
+
+            if ( waitpid( pid, &result, 0 ) == -1 ) {
+                result = -errno;
+            }
+            *buffer = stdoutBuf->data;
+            *size   = stdoutBuf->available;
+            free( stdoutBuf ); /* but don't free stdoutBuf->data! */
+
+            if ( stderrBuf->available > 0 ) {
+                logWarning( "stderr output from %s%s",
+                            privateData->templates.path,
+                            fh->path );
+                logTextBlock( kLogWarning,
+                              stderrBuf->data,
+                              stderrBuf->available );
+            }
+            releaseElasticBuffer( stderrBuf );
+
+            close( epfd );
+            break;
+        }
+        close( stdoutPipe[kPipeReadIdx] );
+        close( stderrPipe[kPipeReadIdx] );
+    }
+
+
+#ifdef DEBUG
+    logDebug( "%s exit code: %d", fh->path, result );
+#else
+    if ( result != 0 ) {
+        logError( "%s exit code: %d", fh->path, result );
+    }
+#endif
+
+    return result;
 }
 
 /** Open a file
@@ -857,14 +1064,16 @@ int openFileOp( const char * path, struct fuse_file_info * fi )
             }
         }
         if ( fh != NULL ) {
-            fh->isTemplate = hasTemplate( path );
+            fh->path         = strdup( path );
+            fh->isTemplate   = hasTemplate( path );
+            fh->isExecutable = isExecutable( path );
 
             int rootfd;
             if ( fh->isTemplate ) {
-                fuse_log( FUSE_LOG_DEBUG, "have template" );
+                logDebug( "have%s template", fh->isExecutable ? " executable" : "" );
                 rootfd = getTemplateFD();
             } else {
-                fuse_log( FUSE_LOG_DEBUG, "regular file" );
+                logDebug( "regular file" );
                 rootfd = getMountpointFD();
             }
 
@@ -872,9 +1081,14 @@ int openFileOp( const char * path, struct fuse_file_info * fi )
             if ( fd < 0 ) {
                 result = fd;
             } else {
+                fh->path = strdup( path );
                 fh->fd = fd;
                 if ( fh->isTemplate ) {
-                    result = processTemplate( fh->fd, &fh->contents, &fh->length );
+                    if ( fh->isExecutable ) {
+                        result = executeTemplate( fh, &fh->contents, &fh->length );
+                    } else {
+                        result = processTemplate( fh->fd, &fh->contents, &fh->length );
+                    }
                 }
             }
         }
@@ -924,17 +1138,17 @@ int readFileOp( const char * UNUSED( path ),
     return result;
 }
 
-/** Store data from an open file in a buffer
+/** Store data from an open file in a data
  *
  * Similar to the read() method, but data is stored and
- * returned in a generic buffer.
+ * returned in a generic data.
  *
  * No actual copying of data has to take place, the source
- * file descriptor may simply be stored in the buffer for
+ * file descriptor may simply be stored in the data for
  * later data transfer.
  *
- * The buffer must be allocated dynamically and stored at the
- * location pointed to by bufp.  If the buffer contains memory
+ * The data must be allocated dynamically and stored at the
+ * location pointed to by bufp.  If the data contains memory
  * regions, they too must be allocated using malloc().  The
  * allocated memory will be freed by the caller.
  */
@@ -1006,10 +1220,10 @@ int writeFileOp( const char * UNUSED( path ), const char * buf, size_t size,
     return result;
 }
 
-/** Write contents of buffer to an open file
+/** Write contents of data to an open file
  *
  * Similar to the write() method, but data is supplied in a
- * generic buffer.  Use fuse_buf_copy() to transfer data to
+ * generic data.  Use fuse_buf_copy() to transfer data to
  * the destination.
  *
  * Unless FUSE_CAP_HANDLE_KILLPRIV is disabled, this method is
