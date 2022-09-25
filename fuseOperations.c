@@ -6,16 +6,16 @@
 #include "templatefs.h"
 #include "logStuff.h"
 
+#include <stdbool.h>
+#include <sys/file.h>   /* flock(2) */
+#include <sys/epoll.h>
+#include <sys/wait.h>
+
 #ifdef HAVE_SETXATTR
 #include <sys/xattr.h>
 #endif
 
-#include <sys/file.h> /* flock(2) */
-
 #include <fuse3/fuse.h>
-#include <stdbool.h>
-#include <sys/epoll.h>
-#include <sys/wait.h>
 
 #include "fuseOperations.h"
 #include "processTemplate.h"
@@ -27,33 +27,30 @@ typedef struct {
 } tFSTree;
 
 typedef struct {
-    tFSTree mountpoint;    // absolute path to the mount point
-    tFSTree templates;     // absolute path to the top of the template hierarchy
+    tFSTree  mountpoint;    ///< absolute path to the mount point
+    tFSTree  templates;     ///< absolute path to the top of the template hierarchy
 } tPrivateData;
 
 typedef struct {
-    const char * path;
-    /* -1 if fd not valid */
-    int    fd;
-    /* if isTemplate == false, transparently pass through the file 'underneath'.
-     * if isTemplate == true, then use the 'contents' data, which is the result of parsing the template */
-    bool   isTemplate;
-    /* true if it's an _executable_ template file */
-    bool   isExecutable;
+    const char *  path;          ///< absolute path to the file
+    int           fd;            ///< file descriptor. -1 if fd not open/valid */
+    bool          isTemplate;    ///< true if there's a template file to process, else pass request through
+    bool          isExecutable;  ///< true if the templatee file is _executable_
 
-    size_t length;
-    byte * contents;
+    byte *        contents;      ///< the cached result of processing the template file
+    size_t        length;        ///< length of the cached file contents
 } tFHFile;
 
 typedef struct {
-    DIR           * dp;
-    struct dirent * entry;
-    off_t offset;
+    DIR *            dp;
+    struct dirent *  entry;
+    off_t            offset;
 } tFHDir;
 
 typedef struct {
-    /* * * MUST BE FIRST * * */
-    /* tFHHandle. tFHFile, and tFHDir are cast back and forth */
+    /* * * UNION MUST BE FIRST * * */
+    /* tFHHandle. tFHFile, and tFHDir are cast back and
+     * forth, based on the value of the type field */
     union {
         tFHFile file;
         tFHDir  directory;
@@ -61,49 +58,82 @@ typedef struct {
 
     /* how the union should be accessed */
     enum {
-        isUninitialized = 0, isFile, isDirectory
-    } type;
+        notInitialized = 0,  ///< hasn't been set yet
+        isFile,              ///< use the 'file' field of the union
+        isDirectory          ///< use the 'directory' field of the union
+    } type;                  ///< indicates which field of the union to use
 
 } tFileHandle;
 
+/**
+ * @brief a buffer that expands as it fills
+ * @see newElasticBuffer()
+ * @see releaseElasticBuffer()
+ * @see makeRoom()
+ * @see getSpacePtr()
+ * @see increaseAvailable()
+ */
 typedef struct {
-    char * data;
-    ssize_t available;
-    ssize_t remaining;
-    ssize_t headroom;
+    char *   data;       ///< pointer to the data, caution: may move when realloc'd
+    ssize_t  available;  ///< amount of data currently in the buffer
+    ssize_t  remaining;  ///< amount of unused space lwft
+    ssize_t  headroom;   ///< the amount of 'space' that's added
 } tElasticBuffer;
 
 // ------------------------------------------------------------------------------
 
+/**
+ * @brief allocate a new, empty buffer
+ * @param size      initial size of buffer
+ * @param headroom  amount to ensure we have ready to fill
+ * @return the buffer structure, or NULL if failed.
+ */
 tElasticBuffer * newElasticBuffer( size_t size, size_t headroom )
 {
     tElasticBuffer * result = calloc(1, sizeof(tElasticBuffer));
     if ( result != NULL ) {
         result->data      = calloc( 1, size);
         result->available = 0;
-        result->remaining = size;
+        if ( result->data != NULL ) {
+            result->remaining = size;
+        }
         result->headroom = headroom;
     }
     return result;
 }
 
+/**
+ * @brief release the resources in use by the elastic buffer
+ * @param buf the elastic buffer
+ */
 void releaseElasticBuffer( tElasticBuffer * buf )
 {
     free( buf->data );
     free( buf );
 }
 
-/* Caution: calling realloc can move the data buffer. Be sure to call this
- * function *before* you fetch buf->data */
-size_t makeRoom( tElasticBuffer * buf )
+/**
+ * @brief ensure that there's at least 'headroom' bytes available in the buffer
+ *
+ * Caution: calling realloc() may move the data buffer.
+ *
+ * @param buf  the elastic buffer to check/expand
+ * @return the number of bytes now available
+ */
+static size_t makeRoom( tElasticBuffer * buf )
 {
     if ( buf->remaining < buf->headroom ) {
         buf->remaining += buf->headroom * 2;
-        buf->data = realloc( buf->data, buf->available + buf->remaining );
+        buf->data       = realloc( buf->data, buf->available + buf->remaining );
     }
     return buf->remaining;
 }
 
+/**
+ * @brief
+ * @param buf
+ * @return
+ */
 char * getSpacePtr( tElasticBuffer * buf )
 {
     /* Caution: if makeRoom causes a realloc, make sure it
@@ -112,6 +142,11 @@ char * getSpacePtr( tElasticBuffer * buf )
     return buf->data + buf->available;
 }
 
+/**
+ * @brief increase
+ * @param buf
+ * @param additional
+ */
 void increaseAvailable( tElasticBuffer * buf, size_t additional )
 {
     buf->available += additional;
@@ -242,12 +277,22 @@ int getTemplateFD( void )
 
 static inline bool hasTemplate( const char * path )
 {
-    return ( faccessat( getTemplateFD(), &path[1], R_OK, AT_SYMLINK_NOFOLLOW ) == 0 );
+    bool result = ( faccessat( getTemplateFD(),
+                               &path[1],
+                               R_OK,
+                               AT_SYMLINK_NOFOLLOW ) == 0 );
+    errno = 0;
+    return ( result );
 }
 
 static inline bool isExecutable( const char * path )
 {
-    return ( faccessat( getTemplateFD(), &path[1], X_OK, AT_SYMLINK_NOFOLLOW ) == 0 );
+    bool result = ( faccessat( getTemplateFD(),
+                               &path[1],
+                               X_OK,
+                               AT_SYMLINK_NOFOLLOW ) == 0 );
+    errno = 0;
+    return ( result );
 }
 
 int setupFSTree( tFSTree * tree, const char * path )
@@ -941,20 +986,22 @@ int executeTemplate( tFHFile *fh, byte ** buffer, size_t * size )
                 for ( int i = 0; i < eventCount; i++ ) {
                     int eventFD = events[ i ].data.fd;
                     if ( events[ i ].events & EPOLLIN ) {
+                        tElasticBuffer * buff = NULL;
                         if ( eventFD == stdoutPipe[ kPipeReadIdx ] ) {
-                            size_t readSize = read( eventFD,
-                                                    getSpacePtr( stdoutBuf ),
-                                                    makeRoom( stdoutBuf ) );
-                            increaseAvailable( stdoutBuf, readSize );
+                            buff = stdoutBuf;
                         } else if ( eventFD == stderrPipe[ kPipeReadIdx ] ) {
+                            buff = stderrBuf;
+                        } else {
+                            logError( "epoll shows data available on"
+                                      " unknown file descriptor %d", eventFD );
+                            /* throw away the data, or we'll continue to get the same event */
+                            lseek( eventFD, 0, SEEK_END );
+                        }
+                        if ( buff != NULL ) {
                             size_t readSize = read( eventFD,
                                                     getSpacePtr( stderrBuf ),
                                                     makeRoom( stderrBuf ) );
                             increaseAvailable( stderrBuf, readSize );
-                        } else {
-                            logError( "epoll indicated data available on"
-                                      " unrecognized file descriptor %d", eventFD );
-                            /* ToDo: throw away the data, or we'll continue to get the same event */
                         }
                     }
                     if ( events[ i ].events & ( EPOLLHUP | EPOLLERR ) ) {

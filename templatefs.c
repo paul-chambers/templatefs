@@ -136,7 +136,7 @@ int lightFuse( struct fuse_args * args )
                      &templatefsOperations,
                      sizeof( templatefsOperations ),
                      initPrivateData( globals.options.mountpoint,
-                                      globals.template.templates ) );
+                                                globals.template.templates ) );
 
     if ( fuse == NULL)
     {
